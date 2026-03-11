@@ -32,15 +32,15 @@ env/
 *.swo
 *~
 
-# Results and data
-results/
+# Results and data (keep results for now)
+# results/
 models/
 error/
 summary/
-*.csv
-*.png
-*.jpg
-*.jpeg
+# *.csv
+# *.png
+# *.jpg
+# *.jpeg
 
 # Temporary files
 *.tmp

@@ -1,0 +1,2 @@
+experiment_id,power_cap_w,actual_power_cap_w,load_type,request_count,concurrency,max_tokens,total_time_s,total_energy_j,total_tokens,throughput_tps,avg_ttft_ms,avg_tbt_ms,avg_e2e_ms,edp
+300W_mixed_8c_1773156666,300,350.0,mixed,50,8,100,337.9529113769531,77757.97104455592,5000,14.794960574915697,72.84381866455078,66.80136959962171,6686.1794090271,519903744.88583523

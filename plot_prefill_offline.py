@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""Prefill 离线建模结果绘图脚本（独立版）
-
-输入：run_prefill_modeling.py 产出的 *_raw.csv 与 *_aggregated.csv
-输出：
-- 输入 token 数 vs Prefill 功率/能耗散点图 + 拟合曲线
-- 输入 token 数 vs TTFT 散点图 + 拟合曲线
-"""
+"""Standalone plotting script for prefill offline modeling results."""
 
 import argparse
 import glob
@@ -19,12 +13,15 @@ import pandas as pd
 
 try:
     from scipy.optimize import curve_fit
+
     HAS_SCIPY = True
 except ImportError:
     HAS_SCIPY = False
 
 
 plt.style.use("seaborn-v0_8-whitegrid")
+plt.rcParams["font.sans-serif"] = ["DejaVu Sans"]
+plt.rcParams["axes.unicode_minus"] = False
 
 
 def linear_func(x, a, b):
@@ -40,7 +37,7 @@ def sqrt_func(x, a, b):
 
 
 def poly2_func(x, a, b, c):
-    return a * x ** 2 + b * x + c
+    return a * x**2 + b * x + c
 
 
 FIT_FUNCTIONS = {
@@ -56,6 +53,13 @@ def find_latest_csv(input_dir: str, suffix: str) -> Optional[str]:
     if not files:
         return None
     return max(files, key=os.path.getmtime)
+
+
+def pick_first_existing(df: pd.DataFrame, candidates) -> str:
+    for col in candidates:
+        if col in df.columns:
+            return col
+    raise KeyError(f"None of the candidate columns exist: {candidates}")
 
 
 def fit_best_curve(x: np.ndarray, y: np.ndarray) -> Tuple[Optional[str], Optional[np.ndarray], float]:
@@ -78,17 +82,21 @@ def fit_best_curve(x: np.ndarray, y: np.ndarray) -> Tuple[Optional[str], Optiona
     return best_name, best_params, best_r2
 
 
-def plot_metric(raw_df: pd.DataFrame,
-                agg_df: pd.DataFrame,
-                y_raw_col: str,
-                y_agg_col: str,
-                y_std_col: str,
-                y_label: str,
-                title: str,
-                output_path: str) -> Dict:
-    x_raw = raw_df["actual_tokens"].values if "actual_tokens" in raw_df.columns else raw_df["target_tokens"].values
-    x_agg = agg_df["avg_actual_tokens"].values if "avg_actual_tokens" in agg_df.columns else agg_df["target_tokens"].values
+def plot_metric(
+    raw_df: pd.DataFrame,
+    agg_df: pd.DataFrame,
+    y_raw_col: str,
+    y_agg_col: str,
+    y_std_col: str,
+    y_label: str,
+    title: str,
+    output_path: str,
+) -> Dict:
+    x_raw_col = pick_first_existing(raw_df, ["actual_tokens", "actual_input_tokens", "target_tokens", "input_tokens"])
+    x_agg_col = pick_first_existing(agg_df, ["avg_actual_tokens", "target_tokens", "input_tokens"])
 
+    x_raw = raw_df[x_raw_col].values
+    x_agg = agg_df[x_agg_col].values
     y_raw = raw_df[y_raw_col].values
     y_agg = agg_df[y_agg_col].values
     y_std = agg_df[y_std_col].values if y_std_col in agg_df.columns else np.zeros_like(y_agg)
@@ -102,11 +110,21 @@ def plot_metric(raw_df: pd.DataFrame,
         func = FIT_FUNCTIONS[fit_name][0]
         x_smooth = np.linspace(np.min(x_agg), np.max(x_agg), 300)
         y_smooth = func(x_smooth, *fit_params)
-        ax.plot(x_smooth, y_smooth, "r--", linewidth=2, label=f"{fit_name} fit (R²={fit_r2:.4f})")
+        ax.plot(x_smooth, y_smooth, "r--", linewidth=2, label=f"{fit_name} fit (R^2={fit_r2:.4f})")
 
+    max_x = np.max(x_agg)
+    if max_x <= 500:
+        xticks = np.arange(0, max_x + 100, 100)
+    elif max_x <= 1000:
+        xticks = np.arange(0, max_x + 250, 250)
+    else:
+        xticks = np.arange(0, max_x + 500, 500)
+
+    ax.set_xticks(xticks)
     ax.set_xlabel("Input Tokens")
     ax.set_ylabel(y_label)
     ax.set_title(title)
+    ax.grid(True, alpha=0.3)
     ax.legend()
     plt.tight_layout()
     plt.savefig(output_path, dpi=250)
@@ -121,11 +139,11 @@ def plot_metric(raw_df: pd.DataFrame,
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Prefill 离线建模绘图")
-    parser.add_argument("--input-dir", default="results/prefill_modeling", help="实验结果目录")
-    parser.add_argument("--output-dir", default=None, help="图片输出目录，默认 input-dir/images_v2")
-    parser.add_argument("--raw-file", default=None, help="指定 raw csv")
-    parser.add_argument("--agg-file", default=None, help="指定 aggregated csv")
+    parser = argparse.ArgumentParser(description="Prefill offline modeling plotting")
+    parser.add_argument("--input-dir", default="results/prefill_modeling", help="Experiment result directory")
+    parser.add_argument("--output-dir", default=None, help="Image output directory, default: input-dir/images_v2")
+    parser.add_argument("--raw-file", default=None, help="Explicit raw csv path")
+    parser.add_argument("--agg-file", default=None, help="Explicit aggregated csv path")
     args = parser.parse_args()
 
     output_dir = args.output_dir or os.path.join(args.input_dir, "images_v2")
@@ -135,35 +153,65 @@ def main() -> None:
     agg_file = args.agg_file or find_latest_csv(args.input_dir, "_aggregated.csv")
 
     if raw_file is None or agg_file is None:
-        raise FileNotFoundError("未找到 raw/aggregated csv，请先运行 run_prefill_modeling.py")
+        raise FileNotFoundError("Could not find raw/aggregated csv files. Run run_prefill_modeling.py first.")
 
     raw_df = pd.read_csv(raw_file)
     agg_df = pd.read_csv(agg_file)
 
+    energy_raw_col = "dynamic_energy_j" if "dynamic_energy_j" in raw_df.columns else "total_energy_j"
+    energy_agg_col = "avg_dynamic_energy_j" if "avg_dynamic_energy_j" in agg_df.columns else "avg_energy_j"
+    energy_std_col = "std_dynamic_energy_j" if "std_dynamic_energy_j" in agg_df.columns else "std_energy_j"
+
     summary = {
         "raw_file": raw_file,
         "agg_file": agg_file,
+        "metric_columns": {
+            "energy_raw_col": energy_raw_col,
+            "energy_agg_col": energy_agg_col,
+            "energy_std_col": energy_std_col,
+        },
         "plots": {
-            "power": plot_metric(
-                raw_df, agg_df,
-                y_raw_col="avg_power_w", y_agg_col="avg_power_w", y_std_col="std_power_w",
-                y_label="Prefill Average Power (W)",
-                title="Input Tokens vs Prefill Power",
-                output_path=os.path.join(output_dir, "prefill_power_vs_tokens.png"),
-            ),
-            "energy": plot_metric(
-                raw_df, agg_df,
-                y_raw_col="total_energy_j", y_agg_col="avg_energy_j", y_std_col="std_energy_j",
-                y_label="Prefill Energy (J)",
-                title="Input Tokens vs Prefill Energy",
-                output_path=os.path.join(output_dir, "prefill_energy_vs_tokens.png"),
-            ),
             "ttft": plot_metric(
-                raw_df, agg_df,
-                y_raw_col="ttft_ms", y_agg_col="avg_ttft_ms", y_std_col="std_ttft_ms",
+                raw_df,
+                agg_df,
+                y_raw_col="ttft_ms",
+                y_agg_col="avg_ttft_ms",
+                y_std_col="std_ttft_ms",
                 y_label="TTFT (ms)",
                 title="Input Tokens vs TTFT",
                 output_path=os.path.join(output_dir, "prefill_ttft_vs_tokens.png"),
+            ),
+            "energy": plot_metric(
+                raw_df,
+                agg_df,
+                y_raw_col=energy_raw_col,
+                y_agg_col=energy_agg_col,
+                y_std_col=energy_std_col,
+                y_label="Prefill Dynamic Energy (J)" if energy_raw_col == "dynamic_energy_j" else "Prefill Energy (J)",
+                title="Input Tokens vs Prefill Dynamic Energy"
+                if energy_raw_col == "dynamic_energy_j"
+                else "Input Tokens vs Prefill Energy",
+                output_path=os.path.join(output_dir, "prefill_energy_vs_tokens.png"),
+            ),
+            "peak_power": plot_metric(
+                raw_df,
+                agg_df,
+                y_raw_col="peak_power_w",
+                y_agg_col="peak_power_w",
+                y_std_col="std_power_w",
+                y_label="Prefill Peak Power (W)",
+                title="Input Tokens vs Prefill Peak Power",
+                output_path=os.path.join(output_dir, "prefill_peak_power_vs_tokens.png"),
+            ),
+            "avg_power": plot_metric(
+                raw_df,
+                agg_df,
+                y_raw_col="avg_power_w",
+                y_agg_col="avg_power_w",
+                y_std_col="std_power_w",
+                y_label="Prefill Average Power (W)",
+                title="Input Tokens vs Prefill Average Power",
+                output_path=os.path.join(output_dir, "prefill_avg_power_vs_tokens.png"),
             ),
         },
     }

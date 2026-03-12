@@ -124,8 +124,8 @@ def run_prefill_experiment(input_token_counts: List[int],
             "prompt_preview": prompt[:50] if len(prompt) > 50 else prompt
         })
 
-        # 短暂的间隔，避免推理完全连续
-        time.sleep(0.01)
+        # 推理间隔：给GPU功率回落和稳定的时间
+        time.sleep(0.2)
 
     # 停止监测
     experiment_end_time = time.time()

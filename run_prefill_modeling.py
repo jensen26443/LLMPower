@@ -31,7 +31,8 @@ def run_prefill_experiment(input_token_counts: List[int],
                            model_path: str = None,
                            tokenizer_path: str = "./Qwen2.5-7B-Instruct-AWQ",
                            sharegpt_dir: str = "./input/ShareGPT",
-                           time_padding_ms: float = 40.0,
+                           time_padding_ms: float = 5.0,
+                           idle_baseline_sec: float = 2.0,
                            sudo_password: str = None,
                            skip_set_power: bool = False):
     """运行预填充阶段建模实验（连续推理版本）
@@ -44,7 +45,8 @@ def run_prefill_experiment(input_token_counts: List[int],
         model_path: 模型路径
         tokenizer_path: Qwen2.5分词器路径
         sharegpt_dir: ShareGPT数据集目录
-        time_padding_ms: 推理窗口前后补偿时间（毫秒），用于覆盖功率传感器上报延迟
+        time_padding_ms: 推理窗口前后补偿时间（毫秒），仅用于峰值统计
+        idle_baseline_sec: 正式实验前的空闲基线采样时长（秒）
         sudo_password: sudo密码
         skip_set_power: 跳过设置功率步骤
     """
@@ -96,6 +98,12 @@ def run_prefill_experiment(input_token_counts: List[int],
     # 启动功率监测（连续监测整个实验过程）
     monitor = PowerMonitor(sample_interval=0.02)  # 更高的采样频率：50Hz
     monitor.start()
+    print(f"采样后端: {monitor._backend}")
+    if monitor._backend != "pynvml":
+        print("警告: 当前使用 nvidia-smi 轮询，短时 prefill 功率可能被严重平滑，建议安装 pynvml 后重跑。")
+
+    print(f"采集空闲基线 {idle_baseline_sec:.1f}s...")
+    time.sleep(max(0.0, idle_baseline_sec))
     experiment_start_time = time.time()
 
     # 运行所有实验，记录每个实验的时间戳
@@ -206,7 +214,7 @@ def run_prefill_experiment(input_token_counts: List[int],
 
 def analyze_power_timeline(results: List[Dict], power_data: List[Dict],
                           experiment_start_time: float,
-                          time_padding_ms: float = 40.0) -> List[Dict]:
+                          time_padding_ms: float = 5.0) -> List[Dict]:
     """分析功率时间线，提取每个推理期间的功率数据
 
     Args:
@@ -217,13 +225,11 @@ def analyze_power_timeline(results: List[Dict], power_data: List[Dict],
     Returns:
         更新后的结果列表，包含功率统计
     """
-    from statistics import mean, stdev
+    from statistics import mean
 
-    # 估计空闲基线功率：使用前10%样本（最少5个点）
-    if len(power_data) >= 5:
-        baseline_count = max(5, int(len(power_data) * 0.1))
-        baseline_count = min(len(power_data), baseline_count)
-        idle_baseline_w = mean([x["power_w"] for x in power_data[:baseline_count]])
+    baseline_samples = [x["power_w"] for x in power_data if x["timestamp"] < experiment_start_time]
+    if len(baseline_samples) >= 3:
+        idle_baseline_w = mean(baseline_samples)
     else:
         idle_baseline_w = 0.0
 
@@ -233,87 +239,68 @@ def analyze_power_timeline(results: List[Dict], power_data: List[Dict],
     for result in results:
         start_time = result["inference_start"] - padding_s
         end_time = result["inference_end"] + padding_s
+        exact_start_time = result["inference_start"]
+        exact_end_time = result["inference_end"]
 
-        # 提取这个时间范围内的功率数据
-        relevant_powers = []
+        def interpolate_power(timestamp: float) -> float:
+            if not power_data:
+                return 0.0
+            if timestamp <= power_data[0]["timestamp"]:
+                return power_data[0]["power_w"]
+            if timestamp >= power_data[-1]["timestamp"]:
+                return power_data[-1]["power_w"]
+
+            for i in range(1, len(power_data)):
+                prev_point = power_data[i - 1]
+                next_point = power_data[i]
+                if prev_point["timestamp"] <= timestamp <= next_point["timestamp"]:
+                    span = next_point["timestamp"] - prev_point["timestamp"]
+                    if span <= 0:
+                        return next_point["power_w"]
+                    ratio = (timestamp - prev_point["timestamp"]) / span
+                    return prev_point["power_w"] + ratio * (next_point["power_w"] - prev_point["power_w"])
+            return power_data[-1]["power_w"]
+
+        # 平均功率与能耗严格按真实推理窗口计算。
+        window_points = [(exact_start_time, interpolate_power(exact_start_time))]
         for pd in power_data:
             t = pd["timestamp"]
-            if start_time <= t <= end_time:
-                relevant_powers.append(pd["power_w"])
+            if exact_start_time < t < exact_end_time:
+                window_points.append((t, pd["power_w"]))
+        window_points.append((exact_end_time, interpolate_power(exact_end_time)))
+        window_points.sort(key=lambda item: item[0])
 
-        # 计算统计量 - 降低要求，只要有数据就用
-        if len(relevant_powers) >= 1:
-            avg_power = mean(relevant_powers)
-            peak_power = max(relevant_powers)
-            min_power = min(relevant_powers)
+        relevant_powers = [power for _, power in window_points]
 
-            # 计算能耗：梯形积分
+        if len(relevant_powers) >= 2:
             energy = 0.0
-            for i in range(1, len(power_data)):
-                t_prev = power_data[i-1]["timestamp"]
-                t_curr = power_data[i]["timestamp"]
-                if t_curr < start_time:
-                    continue
-                if t_prev > end_time:
-                    break
-                # 时间区间与推理窗口的交集
-                t_start = max(t_prev, start_time)
-                t_end = min(t_curr, end_time)
-                dt = t_end - t_start
+            for i in range(1, len(window_points)):
+                t_prev, p_prev = window_points[i - 1]
+                t_curr, p_curr = window_points[i]
+                dt = t_curr - t_prev
                 if dt > 0:
-                    p_prev = power_data[i-1]["power_w"]
-                    p_curr = power_data[i]["power_w"]
                     avg_p = (p_prev + p_curr) / 2
                     energy += avg_p * dt
-
+            duration = max(0.0, exact_end_time - exact_start_time)
+            avg_power = energy / duration if duration > 0 else mean(relevant_powers)
         else:
-            # 如果没有精确匹配的点，找最近的点
-            # 找到推理前后最近的采样点
-            closest_before = None
-            closest_after = None
-            for pd in power_data:
-                t = pd["timestamp"]
-                if t < start_time:
-                    closest_before = pd
-                elif t > end_time and closest_after is None:
-                    closest_after = pd
-                    break
+            avg_power = 0.0
+            energy = 0.0
 
-            # 使用邻近点估算
-            if closest_before is not None and closest_after is not None:
-                # 线性插值
-                time_ratio = (start_time - closest_before["timestamp"]) / (closest_after["timestamp"] - closest_before["timestamp"])
-                p_start = closest_before["power_w"] + time_ratio * (closest_after["power_w"] - closest_before["power_w"])
+        # 峰值统计允许极小 padding，避免错过采样边界上的尖峰。
+        padded_powers = []
+        for pd in power_data:
+            if start_time <= pd["timestamp"] <= end_time:
+                padded_powers.append(pd["power_w"])
+        if not padded_powers:
+            padded_powers = relevant_powers
 
-                time_ratio = (end_time - closest_before["timestamp"]) / (closest_after["timestamp"] - closest_before["timestamp"])
-                p_end = closest_before["power_w"] + time_ratio * (closest_after["power_w"] - closest_before["power_w"])
-
-                avg_power = (p_start + p_end) / 2
-                peak_power = max(closest_before["power_w"], closest_after["power_w"])
-                min_power = min(closest_before["power_w"], closest_after["power_w"])
-                energy = avg_power * (end_time - start_time)
-            elif closest_before is not None:
-                # 只用前一个点
-                avg_power = closest_before["power_w"]
-                peak_power = closest_before["power_w"]
-                min_power = closest_before["power_w"]
-                energy = avg_power * (end_time - start_time)
-            elif closest_after is not None:
-                # 只用后一个点
-                avg_power = closest_after["power_w"]
-                peak_power = closest_after["power_w"]
-                min_power = closest_after["power_w"]
-                energy = avg_power * (end_time - start_time)
-            else:
-                # 完全没有数据
-                avg_power = 0.0
-                peak_power = 0.0
-                min_power = 0.0
-                energy = 0.0
+        peak_power = max(padded_powers) if padded_powers else 0.0
+        min_power = min(padded_powers) if padded_powers else 0.0
 
         # 更新结果（同时记录去基线后的动态功率/能耗）
         dynamic_avg_power = max(0.0, avg_power - idle_baseline_w)
-        dynamic_energy = max(0.0, energy - idle_baseline_w * max(0.0, end_time - start_time))
+        dynamic_energy = max(0.0, energy - idle_baseline_w * max(0.0, exact_end_time - exact_start_time))
 
         result["avg_power_w"] = avg_power
         result["peak_power_w"] = peak_power
@@ -413,7 +400,9 @@ if __name__ == "__main__":
     parser.add_argument("--sharegpt-dir", type=str, default="./input/ShareGPT",
                        help="ShareGPT数据集目录")
     parser.add_argument("--time-padding-ms", type=float, default=40.0,
-                       help="推理窗口前后补偿时间（毫秒），用于覆盖功率传感器延迟")
+                       help="推理窗口前后补偿时间（毫秒），仅用于峰值统计")
+    parser.add_argument("--idle-baseline-sec", type=float, default=2.0,
+                       help="正式实验前采集空闲基线的时长（秒）")
     parser.add_argument("--sudo-password", type=str, default=None,
                        help="sudo密码（用于自动设置功率限制）")
     parser.add_argument("--skip-set-power", action="store_true",
@@ -449,6 +438,7 @@ if __name__ == "__main__":
         tokenizer_path=args.tokenizer_path,
         sharegpt_dir=args.sharegpt_dir,
         time_padding_ms=args.time_padding_ms,
+        idle_baseline_sec=args.idle_baseline_sec,
         sudo_password=args.sudo_password,
         skip_set_power=args.skip_set_power
     )

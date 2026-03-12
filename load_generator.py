@@ -299,11 +299,12 @@ class LoadGenerator:
         """
         # 优先尝试从ShareGPT获取真实数据
         if prefer_sharegpt and self.sharegpt_loader:
-            prompt = self.sharegpt_loader.get_prompt_by_token_count(token_count, tolerance=max(2, token_count // 10))
+            tolerance = max(2, min(32, token_count // 20))
+            prompt = self.sharegpt_loader.get_prompt_by_token_count(token_count, tolerance=tolerance)
             if prompt:
                 # 验证token数
                 actual_count = self.count_tokens(prompt)
-                if abs(actual_count - token_count) <= max(5, token_count // 5):
+                if abs(actual_count - token_count) <= tolerance:
                     return prompt
 
         # 如果没有ShareGPT或找不到合适的，使用人工生成的方法
@@ -311,16 +312,16 @@ class LoadGenerator:
 
     def _generate_synthetic_prompt(self, token_count: int) -> str:
         """生成合成的prompt（备用方案）"""
-        # 基础文本，用于构建
-        base_word = "你好"
-        base_text = base_word * 1000  # 足够长的基础文本
+        # 使用可扩展的基础文本，避免长输入长度时上限过低。
+        base_word = "你好世界"
+        base_text = base_word * max(4096, token_count * 8)
 
         if self.tokenizer:
             try:
                 # 使用二分法找到接近目标token数的文本
                 left = 1
                 right = len(base_text)
-                best_text = base_text[:min(token_count * 2, len(base_text))]
+                best_text = base_text[:min(max(token_count * 4, 32), len(base_text))]
                 best_diff = float('inf')
 
                 for _ in range(20):  # 最多迭代20次
@@ -343,15 +344,24 @@ class LoadGenerator:
                 # 验证最终token数
                 final_count = self.count_tokens(best_text)
                 if final_count != token_count:
-                    # 如果不完全匹配，尝试微调
-                    if final_count < token_count:
-                        # 添加更多词
-                        while self.count_tokens(best_text) < token_count:
-                            best_text += base_word
+                    # 如果不完全匹配，按字符增减微调，直到达到目标或无法继续缩小误差。
+                    best_count = final_count
+                    if best_count < token_count:
+                        while best_count < token_count and len(best_text) < len(base_text):
+                            next_text = base_text[:len(best_text) + 1]
+                            next_count = self.count_tokens(next_text)
+                            if next_count < best_count:
+                                break
+                            best_text = next_text
+                            best_count = next_count
                     else:
-                        # 移除一些词
-                        while self.count_tokens(best_text) > token_count and len(best_text) > len(base_word):
-                            best_text = best_text[:-len(base_word)]
+                        while best_count > token_count and len(best_text) > 1:
+                            next_text = best_text[:-1]
+                            next_count = self.count_tokens(next_text)
+                            if next_count > best_count:
+                                break
+                            best_text = next_text
+                            best_count = next_count
 
                 return best_text
 
@@ -359,7 +369,7 @@ class LoadGenerator:
                 print(f"使用tokenizer生成prompt失败: {e}，使用估算方法")
 
         # 回退方案：基于字符数估算
-        estimated_chars = token_count
+        estimated_chars = max(4, token_count * 2)
         repeat_text = "你好世界"
         repeat_count = (estimated_chars // len(repeat_text)) + 1
         prompt = (repeat_text * repeat_count)[:estimated_chars]

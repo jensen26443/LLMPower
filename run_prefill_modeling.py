@@ -31,6 +31,7 @@ def run_prefill_experiment(input_token_counts: List[int],
                            model_path: str = None,
                            tokenizer_path: str = "./Qwen2.5-7B-Instruct-AWQ",
                            sharegpt_dir: str = "./input/ShareGPT",
+                           time_padding_ms: float = 40.0,
                            sudo_password: str = None,
                            skip_set_power: bool = False):
     """运行预填充阶段建模实验（连续推理版本）
@@ -43,6 +44,7 @@ def run_prefill_experiment(input_token_counts: List[int],
         model_path: 模型路径
         tokenizer_path: Qwen2.5分词器路径
         sharegpt_dir: ShareGPT数据集目录
+        time_padding_ms: 推理窗口前后补偿时间（毫秒），用于覆盖功率传感器上报延迟
         sudo_password: sudo密码
         skip_set_power: 跳过设置功率步骤
     """
@@ -73,7 +75,7 @@ def run_prefill_experiment(input_token_counts: List[int],
     print("预热GPU...")
     warmup_prompt = load_generator.generate_prompt_by_token_count(64)
     for _ in range(5):
-        inferencer.infer([warmup_prompt], max_tokens=1)
+        inferencer.infer_prefill_only([warmup_prompt], max_tokens=1)
     time.sleep(2)
 
     # 构建实验队列：(token_count, repeat_id, prompt) 的列表，随机打乱
@@ -133,7 +135,12 @@ def run_prefill_experiment(input_token_counts: List[int],
     print(f"\n推理完成，开始分析功率时间线...")
 
     # 分析每个推理期间的功率数据
-    final_results = analyze_power_timeline(results, power_data, experiment_start_time)
+    final_results = analyze_power_timeline(
+        results,
+        power_data,
+        experiment_start_time,
+        time_padding_ms=time_padding_ms,
+    )
 
     # 保存完整功率时间线
     experiment_id = f"prefill_modeling_continuous_{int(time.time())}"
@@ -159,6 +166,7 @@ def run_prefill_experiment(input_token_counts: List[int],
         fieldnames = ["index", "target_tokens", "repeat_id", "batch_size", "actual_tokens", "ttft_ms",
                      "inference_start", "inference_end", "inference_duration",
                      "avg_power_w", "peak_power_w", "min_power_w", "total_energy_j",
+                     "dynamic_power_w", "dynamic_energy_j", "idle_baseline_w",
                      "prompt_preview"]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -172,6 +180,9 @@ def run_prefill_experiment(input_token_counts: List[int],
         agg_fieldnames = ["target_tokens", "avg_actual_tokens", "count", "batch_size",
                          "avg_power_w", "std_power_w", "peak_power_w",
                          "avg_energy_j", "std_energy_j",
+                         "avg_dynamic_power_w", "std_dynamic_power_w",
+                         "avg_dynamic_energy_j", "std_dynamic_energy_j",
+                         "avg_idle_baseline_w",
                          "avg_ttft_ms", "std_ttft_ms"]
         writer = csv.DictWriter(f, fieldnames=agg_fieldnames)
         writer.writeheader()
@@ -194,7 +205,8 @@ def run_prefill_experiment(input_token_counts: List[int],
 
 
 def analyze_power_timeline(results: List[Dict], power_data: List[Dict],
-                          experiment_start_time: float) -> List[Dict]:
+                          experiment_start_time: float,
+                          time_padding_ms: float = 40.0) -> List[Dict]:
     """分析功率时间线，提取每个推理期间的功率数据
 
     Args:
@@ -207,10 +219,20 @@ def analyze_power_timeline(results: List[Dict], power_data: List[Dict],
     """
     from statistics import mean, stdev
 
+    # 估计空闲基线功率：使用前10%样本（最少5个点）
+    if len(power_data) >= 5:
+        baseline_count = max(5, int(len(power_data) * 0.1))
+        baseline_count = min(len(power_data), baseline_count)
+        idle_baseline_w = mean([x["power_w"] for x in power_data[:baseline_count]])
+    else:
+        idle_baseline_w = 0.0
+
+    padding_s = max(0.0, time_padding_ms / 1000.0)
+
     # 为每个推理结果匹配对应的功率数据
     for result in results:
-        start_time = result["inference_start"]
-        end_time = result["inference_end"]
+        start_time = result["inference_start"] - padding_s
+        end_time = result["inference_end"] + padding_s
 
         # 提取这个时间范围内的功率数据
         relevant_powers = []
@@ -289,11 +311,17 @@ def analyze_power_timeline(results: List[Dict], power_data: List[Dict],
                 min_power = 0.0
                 energy = 0.0
 
-        # 更新结果
+        # 更新结果（同时记录去基线后的动态功率/能耗）
+        dynamic_avg_power = max(0.0, avg_power - idle_baseline_w)
+        dynamic_energy = max(0.0, energy - idle_baseline_w * max(0.0, end_time - start_time))
+
         result["avg_power_w"] = avg_power
         result["peak_power_w"] = peak_power
         result["min_power_w"] = min_power
         result["total_energy_j"] = energy
+        result["dynamic_power_w"] = dynamic_avg_power
+        result["dynamic_energy_j"] = dynamic_energy
+        result["idle_baseline_w"] = idle_baseline_w
 
     return results
 
@@ -315,6 +343,9 @@ def aggregate_results(results: List[Dict]) -> List[Dict]:
         ttfts = [r["ttft_ms"] for r in group]
         actual_tokens_list = [r["actual_tokens"] for r in group]
         peaks = [r["peak_power_w"] for r in group if r["peak_power_w"] > 0]
+        dynamic_powers = [r["dynamic_power_w"] for r in group if r.get("dynamic_power_w", 0) >= 0]
+        dynamic_energies = [r["dynamic_energy_j"] for r in group if r.get("dynamic_energy_j", 0) >= 0]
+        idle_baselines = [r["idle_baseline_w"] for r in group if r.get("idle_baseline_w", 0) > 0]
 
         agg_row = {
             "target_tokens": target_count,
@@ -326,6 +357,11 @@ def aggregate_results(results: List[Dict]) -> List[Dict]:
             "peak_power_w": statistics.mean(peaks) if len(peaks) > 0 else 0,
             "avg_energy_j": statistics.mean(energies) if len(energies) > 0 else 0,
             "std_energy_j": statistics.stdev(energies) if len(energies) > 1 else 0,
+            "avg_dynamic_power_w": statistics.mean(dynamic_powers) if len(dynamic_powers) > 0 else 0,
+            "std_dynamic_power_w": statistics.stdev(dynamic_powers) if len(dynamic_powers) > 1 else 0,
+            "avg_dynamic_energy_j": statistics.mean(dynamic_energies) if len(dynamic_energies) > 0 else 0,
+            "std_dynamic_energy_j": statistics.stdev(dynamic_energies) if len(dynamic_energies) > 1 else 0,
+            "avg_idle_baseline_w": statistics.mean(idle_baselines) if len(idle_baselines) > 0 else 0,
             "avg_ttft_ms": statistics.mean(ttfts) if len(ttfts) > 0 else 0,
             "std_ttft_ms": statistics.stdev(ttfts) if len(ttfts) > 1 else 0,
         }
@@ -376,6 +412,8 @@ if __name__ == "__main__":
                        help="Qwen2.5分词器路径")
     parser.add_argument("--sharegpt-dir", type=str, default="./input/ShareGPT",
                        help="ShareGPT数据集目录")
+    parser.add_argument("--time-padding-ms", type=float, default=40.0,
+                       help="推理窗口前后补偿时间（毫秒），用于覆盖功率传感器延迟")
     parser.add_argument("--sudo-password", type=str, default=None,
                        help="sudo密码（用于自动设置功率限制）")
     parser.add_argument("--skip-set-power", action="store_true",
@@ -410,6 +448,7 @@ if __name__ == "__main__":
         model_path=args.model_path,
         tokenizer_path=args.tokenizer_path,
         sharegpt_dir=args.sharegpt_dir,
+        time_padding_ms=args.time_padding_ms,
         sudo_password=args.sudo_password,
         skip_set_power=args.skip_set_power
     )

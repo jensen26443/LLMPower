@@ -6,6 +6,12 @@ from datetime import datetime
 from typing import List, Dict
 import re
 
+try:
+    import pynvml
+    HAS_PYNVML = True
+except Exception:
+    HAS_PYNVML = False
+
 class PowerMonitor:
     def __init__(self, device_index: int = 0, sample_interval: float = 0.1):
         self.device_index = device_index
@@ -13,9 +19,45 @@ class PowerMonitor:
         self.running = False
         self.power_data: List[Dict] = []
         self.thread = None
+        self._backend = "pynvml" if HAS_PYNVML else "nvidia-smi"
+        self._nvml_initialized = False
+        self._nvml_handle = None
+
+    def _init_backend(self):
+        if self._backend != "pynvml" or self._nvml_initialized:
+            return
+        try:
+            pynvml.nvmlInit()
+            self._nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(self.device_index)
+            self._nvml_initialized = True
+        except Exception as e:
+            print(f"pynvml 初始化失败，回退 nvidia-smi: {e}")
+            self._backend = "nvidia-smi"
+
+    def _shutdown_backend(self):
+        if self._backend == "pynvml" and self._nvml_initialized:
+            try:
+                pynvml.nvmlShutdown()
+            except Exception:
+                pass
+            self._nvml_initialized = False
+            self._nvml_handle = None
 
     def _get_gpu_stats(self):
-        """获取GPU当前统计信息，使用nvidia-smi命令行"""
+        """获取GPU当前统计信息。优先使用 pynvml，失败回退 nvidia-smi。"""
+        if self._backend == "pynvml":
+            try:
+                power_mw = pynvml.nvmlDeviceGetPowerUsage(self._nvml_handle)
+                memory = pynvml.nvmlDeviceGetMemoryInfo(self._nvml_handle)
+                temperature = pynvml.nvmlDeviceGetTemperature(
+                    self._nvml_handle,
+                    pynvml.NVML_TEMPERATURE_GPU,
+                )
+                return power_mw / 1000.0, memory.used / (1024 ** 3), int(temperature)
+            except Exception as e:
+                print(f"pynvml 读取失败，回退 nvidia-smi: {e}")
+                self._backend = "nvidia-smi"
+
         try:
             result = subprocess.run(
                 ["nvidia-smi", "-i", str(self.device_index),
@@ -34,8 +76,9 @@ class PowerMonitor:
 
     def _monitor_loop(self):
         while self.running:
-            timestamp = time.time()
             power, memory_used, temperature = self._get_gpu_stats()
+            # 在采样数据获取后打时间戳，减少命令调用耗时带来的时间偏移
+            timestamp = time.time()
 
             self.power_data.append({
                 "timestamp": timestamp,
@@ -47,6 +90,7 @@ class PowerMonitor:
 
     def start(self):
         """开始监测"""
+        self._init_backend()
         self.running = True
         self.power_data = []
         self.thread = threading.Thread(target=self._monitor_loop, daemon=True)
@@ -57,6 +101,7 @@ class PowerMonitor:
         self.running = False
         if self.thread:
             self.thread.join()
+        self._shutdown_backend()
         return self.power_data
 
     def calculate_total_energy(self) -> float:

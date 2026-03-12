@@ -79,6 +79,45 @@ class LLMInferencer:
         return results
 
 
+    def infer_prefill_only(self, prompts: List[str], max_tokens: int = 1) -> List[Dict]:
+        """仅执行一次生成用于预填充建模。
+
+        说明：
+        - 为避免旧版 `infer` 中"TTFT测量 + 完整生成"导致的重复请求，本方法只发起一次 vLLM
+          生成调用。
+        - 在 `max_tokens=1` 时，端到端耗时可近似视作 TTFT（解码开销仅 1 token，且很小）。
+        """
+        temp_params = SamplingParams(
+            temperature=self.sampling_params.temperature,
+            top_p=self.sampling_params.top_p,
+            max_tokens=max_tokens,
+        )
+
+        results = []
+        for prompt in prompts:
+            start = time.time()
+            outputs = self.llm.generate([prompt], temp_params, use_tqdm=False)
+            end = time.time()
+
+            latency_ms = (end - start) * 1000
+            generated_text = ""
+            token_count = 0
+            if outputs and len(outputs) > 0:
+                generated_text = outputs[0].outputs[0].text
+                token_count = len(outputs[0].outputs[0].token_ids)
+
+            results.append({
+                "prompt": prompt,
+                "generated_text": generated_text,
+                "token_count": token_count,
+                "ttft": latency_ms,
+                "tbt": 0.0,
+                "e2e": latency_ms,
+            })
+
+        return results
+
+
 if __name__ == "__main__":
     inferencer = LLMInferencer()
     results = inferencer.infer(["你好"])

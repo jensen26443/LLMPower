@@ -76,13 +76,13 @@ def run_prefill_experiment(input_token_counts: List[int],
         inferencer.infer([warmup_prompt], max_tokens=1)
     time.sleep(2)
 
-    # 构建实验队列：(token_count, prompt) 的列表，随机打乱
+    # 构建实验队列：(token_count, repeat_id, prompt) 的列表，随机打乱
     experiment_queue = []
     for token_count in input_token_counts:
-        for _ in range(repeats):
+        for repeat_id in range(1, repeats + 1):
             prompt = load_generator.generate_prompt_by_token_count(token_count)
             actual_tokens = load_generator.count_tokens(prompt)
-            experiment_queue.append((token_count, actual_tokens, prompt))
+            experiment_queue.append((token_count, repeat_id, actual_tokens, prompt))
 
     # 打乱顺序，避免系统性偏差
     random.shuffle(experiment_queue)
@@ -98,12 +98,12 @@ def run_prefill_experiment(input_token_counts: List[int],
 
     # 运行所有实验，记录每个实验的时间戳
     results = []
-    for idx, (target_tokens, actual_tokens, prompt) in enumerate(tqdm(experiment_queue, desc="连续推理中")):
+    for idx, (target_tokens, repeat_id, actual_tokens, prompt) in enumerate(tqdm(experiment_queue, desc="连续推理中")):
         # 记录开始时间
         inference_start = time.time()
 
         # 执行推理
-        result = inferencer.infer([prompt], max_tokens=1)[0]
+        result = inferencer.infer_prefill_only([prompt], max_tokens=1)[0]
 
         # 记录结束时间
         inference_end = time.time()
@@ -112,6 +112,8 @@ def run_prefill_experiment(input_token_counts: List[int],
         results.append({
             "index": idx,
             "target_tokens": target_tokens,
+            "repeat_id": repeat_id,
+            "batch_size": 1,
             "actual_tokens": actual_tokens,
             "ttft_ms": result["ttft"],
             "inference_start": inference_start,
@@ -154,7 +156,7 @@ def run_prefill_experiment(input_token_counts: List[int],
     result_file = f"{output_dir}/{experiment_id}_raw.csv"
 
     with open(result_file, 'w', newline='', encoding='utf-8') as f:
-        fieldnames = ["index", "target_tokens", "actual_tokens", "ttft_ms",
+        fieldnames = ["index", "target_tokens", "repeat_id", "batch_size", "actual_tokens", "ttft_ms",
                      "inference_start", "inference_end", "inference_duration",
                      "avg_power_w", "peak_power_w", "min_power_w", "total_energy_j",
                      "prompt_preview"]
@@ -167,7 +169,7 @@ def run_prefill_experiment(input_token_counts: List[int],
     agg_file = f"{output_dir}/{experiment_id}_aggregated.csv"
 
     with open(agg_file, 'w', newline='', encoding='utf-8') as f:
-        agg_fieldnames = ["target_tokens", "avg_actual_tokens", "count",
+        agg_fieldnames = ["target_tokens", "avg_actual_tokens", "count", "batch_size",
                          "avg_power_w", "std_power_w", "peak_power_w",
                          "avg_energy_j", "std_energy_j",
                          "avg_ttft_ms", "std_ttft_ms"]
@@ -318,6 +320,7 @@ def aggregate_results(results: List[Dict]) -> List[Dict]:
             "target_tokens": target_count,
             "avg_actual_tokens": statistics.mean(actual_tokens_list) if len(actual_tokens_list) > 0 else target_count,
             "count": len(group),
+            "batch_size": 1,
             "avg_power_w": statistics.mean(powers) if len(powers) > 0 else 0,
             "std_power_w": statistics.stdev(powers) if len(powers) > 1 else 0,
             "peak_power_w": statistics.mean(peaks) if len(peaks) > 0 else 0,

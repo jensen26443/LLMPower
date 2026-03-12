@@ -33,14 +33,20 @@ graph TD
 |---------|---------|
 | power_control.py | GPU功率限制设置与读取，支持WSL2/服务器双环境 |
 | llm_inference.py | vLLM推理封装，收集TTFT/TBT/E2E指标 |
-| load_generator.py | 生成不同长度的推理负载（short/long/mixed） |
+| load_generator.py | 生成不同长度的推理负载（short/long/mixed），支持按token数精确生成 |
 | monitor.py | 实时监测GPU功率、显存、温度，计算总能耗 |
 | run_experiment.py | 单次实验主流程控制 |
 | analyze_results.py | 实验结果分析与可视化，生成11种图表和报告 |
 | dynamic_power_inference.py | 动态功率调节策略实现（Prefill/Decode分阶段） |
+| run_prefill_modeling.py | 预填充阶段离线建模实验（idea.md第2部分） |
+| analyze_prefill_modeling.py | 预填充阶段结果分析，生成散点图+拟合曲线 |
 | adapt_to_server.py | 服务器环境自动适配工具 |
+| test_env.py | 环境测试工具 |
+| test_load.py | 实验结果加载测试工具 |
 | package_for_server.sh | 代码打包工具（排除大文件） |
 | run_all_fixed_experiments.sh | 批量固定功率实验脚本 |
+| run_175w_experiments.sh | 175W功率挡位单独测试脚本 |
+| run_prefill_experiments.sh | 预填充阶段建模批量实验脚本 |
 
 ## 运行和开发
 ### 环境依赖
@@ -69,8 +75,10 @@ graph TD
 2. 单次实验：`python run_experiment.py --power 240 --load-type mixed --count 100 --concurrency 1`
 3. 使用自定义模型：`python run_experiment.py --power 240 --model-path ./models/YourModel`
 4. 批量实验：`bash run_all_fixed_experiments.sh`
-5. 结果分析：`python analyze_results.py`
-6. 跳过功率设置：添加`--skip-set-power`参数支持手动调整功率后运行
+5. 175W单独测试：`bash run_175w_experiments.sh`
+6. 结果分析：`python analyze_results.py`
+7. 预填充阶段建模实验：`bash run_prefill_experiments.sh`
+8. 跳过功率设置：添加`--skip-set-power`参数支持手动调整功率后运行
 
 ### 核心参数
 - `--power`: 功率限制（单位W，RTX 4080建议范围150-350W）
@@ -120,6 +128,16 @@ graph TD
 
 ## 更新日志
 ### 2026-03-11
+- **图表英文化与线性横坐标**：修改analyze_prefill_modeling.py，所有图表文字改为英文，横坐标改为线性刻度（0,250,500...），移除对数刻度
+- **增加数据点密度**：修改run_prefill_modeling.py，默认使用密集采样模式（1-3000 tokens，约80个采样点，每个点重复20次，共1600个散点）
+- **集成ShareGPT数据集**：新增download_sharegpt.py，重写ShareGPTLoader支持JSONL格式，成功加载10万条中文对话数据，token覆盖范围1-2061
+- **完成idea.md第2部分：预填充阶段离线建模实验**：新增三个核心文件
+  - `run_prefill_modeling.py` - 预填充阶段实验运行脚本，支持不同输入token数（1-4096），每个点重复30次
+  - `analyze_prefill_modeling.py` - 预填充结果分析脚本，生成散点图+5种拟合函数（线性/对数/平方根/二次多项式/幂函数），自动选择最佳拟合
+  - `run_prefill_experiments.sh` - 批量实验一键运行脚本
+- **增强load_generator.py**：新增`generate_prompt_by_token_count()`方法，支持按指定token数精确生成prompt，集成transformers tokenizer验证
+- **预填充建模实验特性**：输出长度固定为1token确保仅预填充阶段，功率固定350W获得最大性能参考
+- **拟合结果输出**：生成拟合公式、R²值、JSON格式拟合参数、Markdown分析报告
 - **基于idea.md完成实验配置**：落实论文实验要求（功率350/300/250/200/150W，并发度8/16/32，max_tokens=100）
 - **实现真实TTFT/TBT测量**：修改llm_inference.py，使用独立测量TTFT（max_tokens=1）和完整生成的方法，替代硬编码的100.0/50.0
 - **添加max_tokens参数**：修改run_experiment.py添加--max-tokens命令行参数，默认值为100
@@ -130,6 +148,7 @@ graph TD
 - **批量脚本配置SUDO_PASSWORD=123456**：支持全自动功率调整
 - **新增4张并发度对比图表**：修改analyze_results.py，添加能耗、E2E、TTFT、TBT四张图表，每张图展示不同功率限制（350W→150W）下concurrency=8/32/64/128的对比曲线
 - **添加175W功率挡位测试**：创建run_175w_experiments.sh脚本，支持175W单独测试（并发度8/32/64/128，重复2次）
+- **新增测试工具**：添加test_load.py实验结果加载测试工具
 
 ### 2026-03-10
 - **完整项目架构扫描与文档更新**

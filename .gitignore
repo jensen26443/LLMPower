@@ -53,3 +53,16 @@ summary/
 *.pth
 *.pt
 *.bin
+
+# Claude Code
+.claude/
+.spec-workflow/
+
+# Model files
+Qwen2.5-7B-Instruct-AWQ/
+
+# Input data
+input/
+
+# Experiment results
+results/prefill_modeling/

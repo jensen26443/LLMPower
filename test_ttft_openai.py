@@ -15,6 +15,7 @@ def main():
     print("\n正在连接 vLLM 服务...")
     inferencer = LLMInferencer(
         model_name="Qwen2.5-7B-Instruct-AWQ",
+        use_service=True,
         base_url="http://localhost:8000/v1",
         start_server=False
     )

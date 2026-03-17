@@ -77,8 +77,7 @@ class LLMInferencer:
         self.llm = LLM(
             model=model_name,
             quantization="awq",
-            gpu_memory_utilization=gpu_memory_utilization,
-            enable_prefix_caching=not disable_prefix_caching
+            gpu_memory_utilization=gpu_memory_utilization
         )
         self.sampling_params = SamplingParams(
             temperature=0.7,
@@ -122,9 +121,6 @@ class LLMInferencer:
             "--quantization", "awq",
             "--gpu-memory-utilization", str(gpu_memory_utilization),
         ]
-
-        if disable_prefix_caching:
-            cmd.append("--disable-prefix-caching")
 
         print(f"正在启动 vLLM 服务: {' '.join(cmd)}")
         self.server_process = subprocess.Popen(cmd)

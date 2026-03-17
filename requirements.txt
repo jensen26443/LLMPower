@@ -18,6 +18,9 @@ seaborn==0.13.0
 tqdm==4.66.0
 pynvml==11.5.0
 
+# OpenAI 兼容客户端
+openai&gt;=1.0.0
+
 # 注意：
 # - torch版本可能需要根据服务器CUDA版本调整
 # - 如果服务器CUDA版本不同，可以删除torch==2.10.0+cu129行，

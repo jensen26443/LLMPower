@@ -143,7 +143,7 @@ class LLMInferencer:
                 self.server_process.kill()
             print("vLLM 服务已停止")
 
-    def infer(self, prompts: List[str], max_tokens: int = None, temperature: float = 0.7) -&gt; List[Dict]:
+    def infer(self, prompts: List[str], max_tokens: int = None, temperature: float = 0.7) -> List[Dict]:
         """
         执行推理，返回包含延迟指标的结果
 
@@ -155,7 +155,7 @@ class LLMInferencer:
         else:
             return self._infer_offline(prompts, max_tokens, temperature)
 
-    def _infer_offline(self, prompts: List[str], max_tokens: int = None, temperature: float = 0.7) -&gt; List[Dict]:
+    def _infer_offline(self, prompts: List[str], max_tokens: int = None, temperature: float = 0.7) -> List[Dict]:
         """离线模式推理：两次调用方法"""
         if max_tokens:
             self.sampling_params.max_tokens = max_tokens
@@ -174,7 +174,7 @@ class LLMInferencer:
             token_count = 0
             final_output = outputs[0] if outputs else None
 
-            if final_output and len(final_output.outputs) &gt; 0:
+            if final_output and len(final_output.outputs) > 0:
                 generated_text = final_output.outputs[0].text
                 token_count = len(final_output.outputs[0].token_ids)
 
@@ -190,7 +190,7 @@ class LLMInferencer:
                     use_metrics = True
 
             # 如果 metrics 不可用，使用两次调用方法
-            if not use_metrics or ttft &lt;= 0:
+            if not use_metrics or ttft <= 0:
                 temp_params = SamplingParams(
                     temperature=temperature,
                     top_p=0.95,
@@ -203,8 +203,8 @@ class LLMInferencer:
 
             # 第三步：计算 TBT
             avg_tbt = 0.0
-            if token_count &gt; 1:
-                if ttft &lt; e2e:
+            if token_count > 1:
+                if ttft < e2e:
                     avg_tbt = (e2e - ttft) / (token_count - 1)
                 else:
                     avg_tbt = e2e / token_count
@@ -220,7 +220,7 @@ class LLMInferencer:
 
         return results
 
-    def _infer_service(self, prompts: List[str], max_tokens: int = 100, temperature: float = 0.7) -&gt; List[Dict]:
+    def _infer_service(self, prompts: List[str], max_tokens: int = 100, temperature: float = 0.7) -> List[Dict]:
         """服务模式推理：流式 API 准确测量"""
         results = []
 
@@ -280,15 +280,15 @@ class LLMInferencer:
 
             # 计算平均 TBT
             avg_tbt = 0.0
-            if len(token_times) &gt; 1:
+            if len(token_times) > 1:
                 tbts = []
                 for i in range(1, len(token_times)):
                     tbt = (token_times[i] - token_times[i-1]) * 1000
                     tbts.append(tbt)
                 avg_tbt = sum(tbts) / len(tbts)
-            elif token_count &gt; 1:
+            elif token_count > 1:
                 # 降级方案
-                avg_tbt = (e2e - ttft) / (token_count - 1) if ttft &lt; e2e else e2e / token_count
+                avg_tbt = (e2e - ttft) / (token_count - 1) if ttft < e2e else e2e / token_count
 
             results.append({
                 "prompt": prompt,
@@ -301,7 +301,7 @@ class LLMInferencer:
 
         return results
 
-    def infer_prefill_only(self, prompts: List[str], max_tokens: int = 1) -&gt; List[Dict]:
+    def infer_prefill_only(self, prompts: List[str], max_tokens: int = 1) -> List[Dict]:
         """
         仅执行一次生成用于预填充建模。
 
@@ -312,7 +312,7 @@ class LLMInferencer:
         else:
             return self._infer_prefill_only_offline(prompts, max_tokens)
 
-    def _infer_prefill_only_offline(self, prompts: List[str], max_tokens: int = 1) -&gt; List[Dict]:
+    def _infer_prefill_only_offline(self, prompts: List[str], max_tokens: int = 1) -> List[Dict]:
         """离线模式预填充测量"""
         temp_params = SamplingParams(
             temperature=self.sampling_params.temperature,
@@ -329,7 +329,7 @@ class LLMInferencer:
             latency_ms = (end - start) * 1000
             generated_text = ""
             token_count = 0
-            if outputs and len(outputs) &gt; 0:
+            if outputs and len(outputs) > 0:
                 generated_text = outputs[0].outputs[0].text
                 token_count = len(outputs[0].outputs[0].token_ids)
 
@@ -344,7 +344,7 @@ class LLMInferencer:
 
         return results
 
-    def _infer_prefill_only_service(self, prompts: List[str], max_tokens: int = 1) -&gt; List[Dict]:
+    def _infer_prefill_only_service(self, prompts: List[str], max_tokens: int = 1) -> List[Dict]:
         """服务模式预填充测量"""
         results = []
 

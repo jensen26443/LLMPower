@@ -36,7 +36,7 @@ def main():
         print(f"  TTFT: {res['ttft']:.2f} ms")
         print(f"  TBT:  {res['tbt']:.2f} ms")
         print(f"  E2E:  {res['e2e']:.2f} ms")
-        if res['tbt'] &gt; 0:
+        if res['tbt'] > 0:
             print(f"  TTFT/TBT 比率: {res['ttft']/res['tbt']:.2f}x")
 
     print("\n" + "=" * 60)

@@ -3,7 +3,7 @@
 本项目是本科毕设《基于动态功率调节的大语言模型推理能耗控制》的实验平台，旨在通过量化研究大语言模型推理过程中功率限制对性能、能效的影响，设计并验证动态功率调节策略，实现推理性能与能耗的最优平衡。
 
 ## 架构概述
-采用轻量脚本式架构，总代码量&lt;500行，划分为6个核心功能模块：功率控制、推理封装、负载生成、实时监测、实验主流程、结果分析。支持固定功率下多并发度实验、动态功率调节实验、结果自动分析与可视化全流程。
+采用轻量脚本式架构，总代码量&lt;1000行，划分为6个核心功能模块：功率控制、推理封装、负载生成、实时监测、实验主流程、结果分析。支持固定功率下多并发度实验、预填充阶段离线建模、功率分桶策略评估、结果自动分析与可视化全流程。
 
 ## 模块结构图
 ```mermaid
@@ -11,13 +11,16 @@ graph TD
     A["(Root) LLM功率控制实验系统"] --&gt; B["docs/ 文档目录"]
     A --&gt; C["models/ 模型文件目录"]
     A --&gt; D["results/ 实验结果目录"]
-    A --&gt; E["error/ 错误日志目录"]
-    A --&gt; F["summary/ 总结文档目录"]
-    A --&gt; G["核心代码模块"]
+    A --&gt; E["results0/ 查询数量实验结果目录"]
+    A --&gt; F["results1/ 策略评估结果目录"]
+    A --&gt; G["papersummary/ 论文总结目录"]
+    A --&gt; H["error/ 错误日志目录"]
+    A --&gt; I["summary/ 总结文档目录"]
+    A --&gt; J["核心代码模块"]
 
     click B "./docs/CLAUDE.md" "查看文档目录"
     click C "./models/CLAUDE.md" "查看模型文件目录"
-    click F "./summary/CLAUDE.md" "查看总结文档目录"
+    click I "./summary/CLAUDE.md" "查看总结文档目录"
 ```
 
 ## 模块索引
@@ -32,21 +35,33 @@ graph TD
 | 模块文件 | 功能描述 |
 |---------|---------|
 | power_control.py | GPU功率限制设置与读取，支持WSL2/服务器双环境 |
-| llm_inference.py | vLLM推理封装，收集TTFT/TBT/E2E指标 |
-| load_generator.py | 生成不同长度的推理负载（short/long/mixed），支持按token数精确生成 |
+| llm_inference.py | vLLM推理封装，收集TTFT/TBT/E2E指标，新增预填充专用方法 |
+| load_generator.py | 生成不同长度的推理负载，支持ShareGPT数据集和精确token控制 |
 | monitor.py | 实时监测GPU功率、显存、温度，计算总能耗 |
 | run_experiment.py | 单次实验主流程控制 |
 | analyze_results.py | 实验结果分析与可视化，生成11种图表和报告 |
 | dynamic_power_inference.py | 动态功率调节策略实现（Prefill/Decode分阶段） |
 | run_prefill_modeling.py | 预填充阶段离线建模实验（idea.md第2部分） |
 | analyze_prefill_modeling.py | 预填充阶段结果分析，生成散点图+拟合曲线 |
+| plot_prefill_offline.py | 预填充离线建模结果独立可视化脚本（高级功能） |
+| run_strategy_evaluation.py | 预填充阶段功率分桶策略评估实验（idea.md第3部分/idea1.md） |
+| analyze_strategy_evaluation.py | 策略评估结果分析，生成6种对比图表 |
+| analyze_gpu_power.py | 静态功率封顶总体对比实验结果分析（idea2.md），生成7种图表 |
+| merge_bucket1.py | 合并bucket1策略实验数据工具 |
+| merge_results.py | 实验结果合并工具 |
+| download_sharegpt.py | ShareGPT数据集下载工具 |
+| reanalyze_power_data.py | 功率数据重新分析工具 |
+| test_prefill_system.py | 预填充系统测试工具 |
 | adapt_to_server.py | 服务器环境自动适配工具 |
 | test_env.py | 环境测试工具 |
 | test_load.py | 实验结果加载测试工具 |
+| run_with_sudo.py | sudo权限运行工具 |
 | package_for_server.sh | 代码打包工具（排除大文件） |
 | run_all_fixed_experiments.sh | 批量固定功率实验脚本 |
 | run_175w_experiments.sh | 175W功率挡位单独测试脚本 |
 | run_prefill_experiments.sh | 预填充阶段建模批量实验脚本 |
+| run_bucket1_only.sh | 仅运行bucket1策略实验脚本 |
+| run_query_count_experiments.sh | 查询数量变化实验脚本（idea2.md） |
 
 ## 运行和开发
 ### 环境依赖
@@ -78,7 +93,10 @@ graph TD
 5. 175W单独测试：`bash run_175w_experiments.sh`
 6. 结果分析：`python analyze_results.py`
 7. 预填充阶段建模实验：`bash run_prefill_experiments.sh`
-8. 跳过功率设置：添加`--skip-set-power`参数支持手动调整功率后运行
+8. 预填充策略评估实验：`python run_strategy_evaluation.py --sudo-password 123456`
+9. 策略评估结果分析：`python analyze_strategy_evaluation.py`
+10. 静态功率封顶查询数量实验分析：`python analyze_gpu_power.py`
+11. 跳过功率设置：添加`--skip-set-power`参数支持手动调整功率后运行
 
 ### 核心参数
 - `--power`: 功率限制（单位W，RTX 4080建议范围150-350W）
@@ -90,6 +108,28 @@ graph TD
 - `--max-tokens`: 最大生成token数量（默认100）
 - `--sudo-password`: sudo密码（用于自动设置功率限制）
 - `--show-power-info`: 显示GPU功率信息并退出
+
+## 实验流程（idea.md/idea1.md/idea2.md）
+### 1. 静态功率封顶总体对比实验（已完成，idea2.md）
+- 测试功率范围：350W, 300W, 250W, 200W, 175W, 150W
+- 查询数量测试：8, 64, 256, 1024（类似范围）
+- 记录指标：总能耗、平均功率、E2E时延、TTFT、TBT、吞吐率、能量-延迟积（EDP）
+- 数据存储：`./results0/data/`
+- 结果分析：`analyze_gpu_power.py`生成7种图表
+- 图表输出：`./results0/img/`
+
+### 2. 预填充阶段离线建模实验（已完成，idea.md第2部分）
+- 拟合关系：P_prefill = f(C), TTFT = g(C)（C为输入token数）
+- 采样范围：1-3000 tokens，约80个采样点，每个点重复20次
+- 输出：散点图+拟合曲线（线性/对数/平方根/二次多项式/幂函数）
+
+### 3. 预填充阶段功率分桶策略对比实验（已完成，idea.md第3部分/idea1.md）
+- 测试策略：Linear 165W/185W、Bucket1/2、Baseline 350W
+- 测试子集：7个真实查询子集（8/16/32/64/103/112/119条请求）
+- 输出：6种对比图表+Markdown分析报告
+
+### 4. 解码阶段离线建模实验（待完成）
+### 5. 最终方法与基线对比实验（待完成）
 
 ## RTX 4080服务器配置说明
 - GPU数量：4块
@@ -127,6 +167,38 @@ graph TD
 - 服务器相关修改参考 `docs/migration_guide.md`
 
 ## 更新日志
+### 2026-03-17（更新）
+- **新增idea1.md和idea2.md实验设计文档**：
+  - `idea1.md` - 预填充阶段功率分桶策略评估详细设计
+  - `idea2.md` - 静态功率封顶总体对比实验（查询数量变化）设计
+- **新增查询数量实验模块**：
+  - `analyze_gpu_power.py` - 静态功率封顶查询数量实验分析，生成7种图表（2x2趋势图、2x2热力图、能效分析、EDP分析、柱状对比、3D配置空间、汇总表）
+  - `run_query_count_experiments.sh` - 查询数量变化实验脚本
+- **新增results0/实验结果目录**：用于存放查询数量变化实验结果
+- **更新模块结构图**：添加results0/和papersummary/目录节点
+- **完善核心代码模块说明**：添加所有新增文件的功能描述
+- **更新运行方式**：添加查询数量实验分析的运行命令
+- **更新实验流程**：补充idea1.md和idea2.md的实验说明
+
+### 2026-03-17
+- **完成idea.md第3部分：预填充阶段功率分桶策略对比实验**：新增4个核心文件
+  - `run_strategy_evaluation.py` - 策略评估实验脚本，测试5种功率策略（Linear 165W/185W、Bucket1/2、Baseline 350W）
+  - `analyze_strategy_evaluation.py` - 策略评估结果分析，生成6种图表（能耗对比、TTFT对比、能耗节省率、TTFT损失率、EDP对比、雷达图）
+  - `run_bucket1_only.sh` - 仅运行bucket1策略的专用脚本
+  - `merge_bucket1.py` - 合并新旧bucket1数据的工具
+- **新增独立绘图脚本**：`plot_prefill_offline.py` - 预填充离线建模结果的独立可视化脚本，支持强制线性拟合、上界曲线等高级功能
+- **新增实验结果管理工具**：
+  - `merge_results.py` - 实验结果合并工具
+  - `run_with_sudo.py` - sudo权限运行工具
+  - `reanalyze_power_data.py` - 功率数据重新分析工具
+  - `test_prefill_system.py` - 预填充系统测试工具
+- **增强llm_inference.py**：新增`infer_prefill_only()`方法，仅执行一次生成避免重复请求，确保预填充阶段测量准确性
+- **完善ShareGPT集成**：`download_sharegpt.py`支持数据集下载，ShareGPTLoader支持JSON/JSONL格式，成功加载10万条中文对话
+- **新增results1/实验结果目录**：用于存放策略评估实验结果，独立于原results/目录
+- **新增papersummary/目录**：用于存放论文总结相关文档
+- **优化预填充建模实验**：增加推理间隔至200ms，改进功率时间线分析算法，支持动态能耗计算（去基线）
+- **策略评估特性**：7个测试子集（8/16/32/64/103/112/119条请求），每个prompt重复100次，完整实验重复3次
+
 ### 2026-03-11
 - **图表英文化与线性横坐标**：修改analyze_prefill_modeling.py，所有图表文字改为英文，横坐标改为线性刻度（0,250,500...），移除对数刻度
 - **增加数据点密度**：修改run_prefill_modeling.py，默认使用密集采样模式（1-3000 tokens，约80个采样点，每个点重复20次，共1600个散点）

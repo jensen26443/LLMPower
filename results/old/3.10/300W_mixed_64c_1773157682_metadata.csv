@@ -1,2 +1,0 @@
-experiment_id,power_cap_w,actual_power_cap_w,load_type,request_count,concurrency,max_tokens,total_time_s,total_energy_j,total_tokens,throughput_tps,avg_ttft_ms,avg_tbt_ms,avg_e2e_ms,edp
-300W_mixed_64c_1773157682,300,350.0,mixed,50,64,100,337.9455301761627,78141.20574857957,5000,14.795283717448852,73.32085132598877,66.79015217405377,6685.545916557312,522416619.0072809

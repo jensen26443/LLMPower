@@ -84,7 +84,8 @@ def run_prefill_experiment(input_token_counts: List[int],
     experiment_queue = []
     for token_count in input_token_counts:
         for repeat_id in range(1, repeats + 1):
-            prompt = load_generator.generate_prompt_by_token_count(token_count)
+            # 使用add_unique_prefix=True确保每个prompt都有唯一前缀，避免vLLM prefix caching
+            prompt = load_generator.generate_prompt_by_token_count(token_count, add_unique_prefix=True)
             actual_tokens = load_generator.count_tokens(prompt)
             experiment_queue.append((token_count, repeat_id, actual_tokens, prompt))
 

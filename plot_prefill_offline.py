@@ -22,6 +22,12 @@ except ImportError:
 plt.style.use("seaborn-v0_8-whitegrid")
 plt.rcParams["font.sans-serif"] = ["DejaVu Sans"]
 plt.rcParams["axes.unicode_minus"] = False
+plt.rcParams["font.size"] = 14
+plt.rcParams["axes.labelsize"] = 16
+plt.rcParams["axes.titlesize"] = 16
+plt.rcParams["xtick.labelsize"] = 12
+plt.rcParams["ytick.labelsize"] = 12
+plt.rcParams["legend.fontsize"] = 14
 
 
 def linear_func(x, a, b):
@@ -62,12 +68,15 @@ def pick_first_existing(df: pd.DataFrame, candidates) -> str:
     raise KeyError(f"None of the candidate columns exist: {candidates}")
 
 
-def fit_best_curve(x: np.ndarray, y: np.ndarray) -> Tuple[Optional[str], Optional[np.ndarray], float]:
+def fit_best_curve(x: np.ndarray, y: np.ndarray, force_linear: bool = False) -> Tuple[Optional[str], Optional[np.ndarray], float]:
     if not HAS_SCIPY:
         return None, None, float("-inf")
 
+    # 如果强制线性拟合，只使用 linear
+    functions_to_try = {"linear": FIT_FUNCTIONS["linear"]} if force_linear else FIT_FUNCTIONS
+
     best_name, best_params, best_r2 = None, None, float("-inf")
-    for name, (func, p0) in FIT_FUNCTIONS.items():
+    for name, (func, p0) in functions_to_try.items():
         try:
             params, _ = curve_fit(func, x, y, p0=p0, maxfev=20000)
             y_hat = func(x, *params)
@@ -91,6 +100,11 @@ def plot_metric(
     y_label: str,
     title: str,
     output_path: str,
+    force_linear: bool = False,
+    show_r2: bool = True,
+    add_upper_bound: bool = False,
+    upper_bound_offset: float = 25.0,
+    show_title: bool = False,
 ) -> Dict:
     x_raw_col = pick_first_existing(raw_df, ["actual_tokens", "actual_input_tokens", "target_tokens", "input_tokens"])
     x_agg_col = pick_first_existing(agg_df, ["avg_actual_tokens", "target_tokens", "input_tokens"])
@@ -105,12 +119,21 @@ def plot_metric(
     ax.scatter(x_raw, y_raw, alpha=0.25, s=16, label="Raw samples")
     ax.errorbar(x_agg, y_agg, yerr=y_std, fmt="o", capsize=4, markersize=6, label="Mean ± Std")
 
-    fit_name, fit_params, fit_r2 = fit_best_curve(x_agg, y_agg)
+    fit_name, fit_params, fit_r2 = fit_best_curve(x_agg, y_agg, force_linear=force_linear)
     if fit_name is not None:
         func = FIT_FUNCTIONS[fit_name][0]
         x_smooth = np.linspace(np.min(x_agg), np.max(x_agg), 300)
         y_smooth = func(x_smooth, *fit_params)
-        ax.plot(x_smooth, y_smooth, "r--", linewidth=2, label=f"{fit_name} fit (R^2={fit_r2:.4f})")
+        if show_r2:
+            label_text = f"{fit_name} fit (R²={fit_r2:.4f})"
+        else:
+            label_text = f"{fit_name} fit"
+        ax.plot(x_smooth, y_smooth, "r--", linewidth=2, label=label_text)
+
+        # 添加上界曲线
+        if add_upper_bound:
+            y_upper = y_smooth + upper_bound_offset
+            ax.plot(x_smooth, y_upper, "g--", linewidth=2, label=f"Upper bound (+{upper_bound_offset:.0f})")
 
     max_x = np.max(x_agg)
     if max_x <= 500:
@@ -121,19 +144,23 @@ def plot_metric(
         xticks = np.arange(0, max_x + 500, 500)
 
     ax.set_xticks(xticks)
-    ax.set_xlabel("Input Tokens")
-    ax.set_ylabel(y_label)
-    ax.set_title(title)
+    ax.set_xlabel("Input Tokens", fontsize=18)
+    ax.set_ylabel(y_label, fontsize=18)
+    ax.tick_params(axis='x', labelsize=14)
+    ax.tick_params(axis='y', labelsize=14)
+    if show_title:
+        ax.set_title(title, fontsize=18)
     ax.grid(True, alpha=0.3)
-    ax.legend()
+    ax.legend(fontsize=14)
     plt.tight_layout()
     plt.savefig(output_path, dpi=250)
     plt.close(fig)
 
     return {
         "fit_function": fit_name,
-        "fit_params": fit_params.tolist() if fit_params is not None else None,
+        "fit_params": fit_params.tolist() if (fit_params is not None and hasattr(fit_params, 'tolist')) else fit_params,
         "r2": fit_r2 if fit_name is not None else None,
+        "upper_bound_offset": upper_bound_offset if add_upper_bound else None,
         "output": output_path,
     }
 
@@ -180,6 +207,8 @@ def main() -> None:
                 y_label="TTFT (ms)",
                 title="Input Tokens vs TTFT",
                 output_path=os.path.join(output_dir, "prefill_ttft_vs_tokens.png"),
+                force_linear=True,
+                show_title=False,
             ),
             "energy": plot_metric(
                 raw_df,
@@ -192,6 +221,8 @@ def main() -> None:
                 if energy_raw_col == "dynamic_energy_j"
                 else "Input Tokens vs Prefill Energy",
                 output_path=os.path.join(output_dir, "prefill_energy_vs_tokens.png"),
+                force_linear=True,
+                show_title=False,
             ),
             "peak_power": plot_metric(
                 raw_df,
@@ -202,6 +233,10 @@ def main() -> None:
                 y_label="Prefill Peak Power (W)",
                 title="Input Tokens vs Prefill Peak Power",
                 output_path=os.path.join(output_dir, "prefill_peak_power_vs_tokens.png"),
+                show_r2=False,
+                add_upper_bound=True,
+                upper_bound_offset=25.0,
+                show_title=False,
             ),
             "avg_power": plot_metric(
                 raw_df,
@@ -212,6 +247,10 @@ def main() -> None:
                 y_label="Prefill Average Power (W)",
                 title="Input Tokens vs Prefill Average Power",
                 output_path=os.path.join(output_dir, "prefill_avg_power_vs_tokens.png"),
+                show_r2=False,
+                add_upper_bound=True,
+                upper_bound_offset=25.0,
+                show_title=False,
             ),
         },
     }

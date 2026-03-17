@@ -70,10 +70,9 @@ def set_power_cap(watts, device_index=0, sudo_password=None):
     """
     try:
         nvidia_smi = get_nvidia_smi_path()
-        cmd = ["sudo", nvidia_smi, "-i", str(device_index), "-pl", str(watts)]
-
         if sudo_password:
-            # 提供了密码，所有环境都使用密码输入
+            # 提供了密码，使用 -S 选项从标准输入读取
+            cmd = ["sudo", "-S", nvidia_smi, "-i", str(device_index), "-pl", str(watts)]
             result = subprocess.run(
                 cmd,
                 input=sudo_password + "\n",
@@ -83,6 +82,7 @@ def set_power_cap(watts, device_index=0, sudo_password=None):
             )
         else:
             # 没有密码，使用系统sudo
+            cmd = ["sudo", nvidia_smi, "-i", str(device_index), "-pl", str(watts)]
             result = subprocess.run(
                 cmd,
                 check=True,

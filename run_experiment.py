@@ -70,7 +70,10 @@ def run_single_experiment(power_cap: int, load_type: str = "mixed", request_coun
 
     print("保存数据...")
     # 保存结果
-    experiment_id = f"{power_cap}W_{load_type}_{concurrency}c_{int(time.time())}"
+    if concurrency == 1:
+        experiment_id = f"{power_cap}W_{load_type}_{request_count}q_{int(time.time())}"
+    else:
+        experiment_id = f"{power_cap}W_{load_type}_{concurrency}c_{int(time.time())}"
 
     # 保存推理结果
     with open(f"{output_dir}/{experiment_id}_inference.csv", 'w', newline='', encoding='utf-8') as f:

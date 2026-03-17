@@ -287,28 +287,59 @@ class LoadGenerator:
         return len(text)
 
     def generate_prompt_by_token_count(self, token_count: int,
-                                       prefer_sharegpt: bool = True) -> str:
+                                       prefer_sharegpt: bool = True,
+                                       add_unique_prefix: bool = True) -> str:
         """生成指定token数的prompt
 
         Args:
             token_count: 目标token数
             prefer_sharegpt: 是否优先使用ShareGPT数据
+            add_unique_prefix: 是否添加唯一前缀以避免vLLM prefix caching
 
         Returns:
             接近指定token数的prompt文本
         """
         # 优先尝试从ShareGPT获取真实数据
+        prompt = None
         if prefer_sharegpt and self.sharegpt_loader:
             tolerance = max(2, min(32, token_count // 20))
             prompt = self.sharegpt_loader.get_prompt_by_token_count(token_count, tolerance=tolerance)
             if prompt:
                 # 验证token数
                 actual_count = self.count_tokens(prompt)
-                if abs(actual_count - token_count) <= tolerance:
-                    return prompt
+                if abs(actual_count - token_count) > tolerance:
+                    prompt = None  # 不符合要求，使用合成方法
 
         # 如果没有ShareGPT或找不到合适的，使用人工生成的方法
-        return self._generate_synthetic_prompt(token_count)
+        if prompt is None:
+            prompt = self._generate_synthetic_prompt(token_count)
+
+        # 添加唯一前缀以避免vLLM prefix caching导致的TTFT失真
+        if add_unique_prefix:
+            import uuid
+            # 使用uuid生成唯一前缀，确保每次请求的prompt前缀都不同
+            # 这样可以绕过vLLM的prefix caching机制
+            unique_prefix = f"[REQ_{uuid.uuid4().hex[:8]}] "
+            prompt = unique_prefix + prompt
+
+            # 调整prompt使其保持目标token数（截断尾部）
+            actual_tokens = self.count_tokens(prompt)
+            if actual_tokens > token_count:
+                # 如果超出目标token数，需要截断原始prompt部分
+                excess = actual_tokens - token_count
+                # 将原始prompt编码后截断
+                if self.tokenizer:
+                    try:
+                        tokens = self.tokenizer.encode(prompt, add_special_tokens=False)
+                        # 截断：保留前缀部分，从尾部去掉excess个token
+                        # 但需要确保至少保留一些内容
+                        if len(tokens) > excess + 10:
+                            truncated_tokens = tokens[:-excess] if excess < len(tokens) else tokens[:10]
+                            prompt = self.tokenizer.decode(truncated_tokens, skip_special_tokens=True)
+                    except:
+                        pass
+
+        return prompt
 
     def _generate_synthetic_prompt(self, token_count: int) -> str:
         """生成合成的prompt（备用方案）"""

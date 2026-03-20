@@ -22,5 +22,6 @@ python -m vllm.entrypoints.openai.api_server \
     --quantization awq \
     --host "$HOST" \
     --port "$PORT" \
-    --gpu-memory-utilization "$GPU_MEM_UTIL"
+    --gpu-memory-utilization "$GPU_MEM_UTIL" \
+    --no-enable-prefix-caching
 

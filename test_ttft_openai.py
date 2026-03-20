@@ -5,6 +5,8 @@
 bash start_vllm_server.sh
 """
 from llm_inference import LLMInferencer
+import time
+import random
 
 
 def main():
@@ -20,10 +22,12 @@ def main():
         start_server=False
     )
 
-    # 测试 prompts
+    # 测试 prompts - 添加随机后缀避免前缀缓存命中
+    random_suffix1 = f" [随机ID:{random.randint(100000, 999999)}]"
+    random_suffix2 = f" [随机ID:{random.randint(100000, 999999)}]"
     test_prompts = [
-        "你好，请介绍一下你自己。",
-        "什么是深度学习？请用简单的语言解释。",
+        f"{random_suffix1}你好，请介绍一下你自己。",
+        f"{random_suffix2}什么是深度学习？请用简单的语言解释。",
     ]
 
     print("\n开始推理测试...")

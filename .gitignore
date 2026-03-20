@@ -32,8 +32,10 @@ env/
 *.swo
 *~
 
-# Results and data (keep results for now)
-# results/
+# Results and data
+results/
+results0/
+results1/
 models/
 error/
 summary/

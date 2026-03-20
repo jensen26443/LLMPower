@@ -104,9 +104,9 @@ def create_comprehensive_plots(df, output_dir='./results0/img'):
 
     metrics_to_plot = {
         'total_energy_kj': ('Energy (KJ)', colors['energy']),
-        'total_time_s': ('Total E2E Time (s)', colors['e2e']),
-        'avg_ttft_ms': ('Time to First Token TTFT (ms)', colors['ttft']),
-        'avg_tbt_ms': ('Time Between Tokens TBT (ms)', colors['tbt'])
+        'total_time_s': ('E2E Latency (s)', colors['e2e']),
+        'avg_ttft_ms': ('Time to First Token (ms)', colors['ttft']),
+        'avg_tbt_ms': ('Time Between Tokens(ms)', colors['tbt'])
     }
 
     # 1. Core Metrics Trend Plots (2x2)
@@ -170,7 +170,7 @@ def create_comprehensive_plots(df, output_dir='./results0/img'):
                 marker='^', linewidth=2.5, markersize=8, label=f'{qc}')
     ax2.set_xlabel('Power Cap (W)', fontsize=14, fontweight='bold')
     ax2.set_ylabel('Throughput (tokens/sec)', fontsize=14, fontweight='bold')
-    ax2.set_title('Throughput Analysis', fontsize=13, fontweight='bold')
+    # ax2.set_title('Throughput Analysis', fontsize=13, fontweight='bold')
     ax2.legend(title='Query Count', fontsize=12, title_fontsize=13)
     ax2.grid(True, alpha=0.3)
 
@@ -252,7 +252,7 @@ def create_comprehensive_plots(df, output_dir='./results0/img'):
     # 7. Save Summary Data Table
     display_df = summary[['parsed_power_cap', 'parsed_query_count', 'total_energy_kj',
                          'total_time_s', 'avg_ttft_ms', 'avg_tbt_ms', 'throughput_tps', 'edp']]
-    display_df.columns = ['Power(W)', 'Query Count', 'Energy(KJ)', 'Total E2E(s)', 'TTFT(ms)', 'TBT(ms)', 'Throughput(TPS)', 'EDP']
+    display_df.columns = ['Power(W)', 'Query Count', 'Energy(KJ)', 'E2E Latency(s)', 'TTFT(ms)', 'TBT(ms)', 'Throughput(TPS)', 'EDP']
     display_df.to_csv(output_path / '7_performance_summary.csv', index=False)
     print(f"\n{'='*60}\nPerformance Data Summary\n{'='*60}")
     print(display_df.to_string(index=False))

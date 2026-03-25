@@ -3,6 +3,8 @@ import time
 import os
 import subprocess
 import atexit
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Optional
 
 # 尝试导入 vLLM 离线模式
@@ -19,11 +21,19 @@ try:
 except ImportError:
     OPENAI_AVAILABLE = False
 
+# 服务模式下用于回退统计输出 token 数
+try:
+    from transformers import AutoTokenizer
+    HAS_TRANSFORMERS_TOKENIZER = True
+except ImportError:
+    HAS_TRANSFORMERS_TOKENIZER = False
+
 
 class LLMInferencer:
     def __init__(
         self,
         model_name: str = "./Qwen2.5-7B-Instruct-AWQ",
+        served_model_name: Optional[str] = None,
         use_service: bool = False,
         base_url: str = "http://localhost:8000/v1",
         api_key: str = "EMPTY",
@@ -39,6 +49,7 @@ class LLMInferencer:
 
         Args:
             model_name: 模型路径或名称
+            served_model_name: 服务模式下 OpenAI API 使用的模型名
             use_service: 是否使用服务模式
             base_url: vLLM 服务地址（服务模式）
             api_key: API 密钥（vLLM 默认 "EMPTY"）
@@ -47,11 +58,15 @@ class LLMInferencer:
             disable_prefix_caching: 是否禁用前缀缓存
         """
         self.model_name = model_name
+        self.served_model_name = served_model_name or model_name
         self.use_service = use_service
         self.client = None
         self.llm = None
         self.sampling_params = None
+        self.tokenizer = None
         self.server_process: Optional[subprocess.Popen] = None
+        self.base_url = base_url
+        self.api_key = api_key
 
         if use_service:
             if not OPENAI_AVAILABLE:
@@ -94,10 +109,9 @@ class LLMInferencer:
         disable_prefix_caching: bool
     ):
         """初始化服务模式"""
-        self.client = OpenAI(
-            base_url=base_url,
-            api_key=api_key
-        )
+        self.base_url = base_url
+        self.api_key = api_key
+        self.client = self._create_service_client()
 
         if start_server:
             self._start_vllm_server(
@@ -105,6 +119,45 @@ class LLMInferencer:
                 gpu_memory_utilization,
                 disable_prefix_caching
             )
+
+    def _create_service_client(self):
+        """创建 OpenAI 兼容客户端。"""
+        return OpenAI(
+            base_url=self.base_url,
+            api_key=self.api_key
+        )
+
+    def _get_tokenizer(self):
+        """延迟加载 tokenizer，用于服务模式下回退统计输出 token 数。"""
+        if self.tokenizer is not None or not HAS_TRANSFORMERS_TOKENIZER:
+            return self.tokenizer
+
+        tokenizer_name = os.path.expanduser(self.model_name)
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer_name,
+                trust_remote_code=True,
+            )
+        except Exception as e:
+            print(f"警告: 加载 tokenizer 失败: {e}")
+            self.tokenizer = None
+
+        return self.tokenizer
+
+    def _count_generated_tokens(self, generated_text: str) -> int:
+        """统计生成文本对应的 token 数，尽量与 vllm bench serve 口径保持一致。"""
+        if not generated_text:
+            return 0
+
+        tokenizer = self._get_tokenizer()
+        if tokenizer:
+            try:
+                return len(tokenizer.encode(generated_text, add_special_tokens=False))
+            except Exception:
+                pass
+
+        # 与 vllm bench serve 的保守回退一致：未知时至少按 1 个输出 token 处理。
+        return 1
 
     def _start_vllm_server(
         self,
@@ -118,9 +171,12 @@ class LLMInferencer:
         cmd = [
             "python", "-m", "vllm.entrypoints.openai.api_server",
             "--model", model_path,
+            "--served-model-name", self.served_model_name,
             "--quantization", "awq",
             "--gpu-memory-utilization", str(gpu_memory_utilization),
         ]
+        if disable_prefix_caching:
+            cmd.append("--no-enable-prefix-caching")
 
         print(f"正在启动 vLLM 服务: {' '.join(cmd)}")
         self.server_process = subprocess.Popen(cmd)
@@ -143,7 +199,8 @@ class LLMInferencer:
                 self.server_process.kill()
             print("vLLM 服务已停止")
 
-    def infer(self, prompts: List[str], max_tokens: int = None, temperature: float = 0.7) -> List[Dict]:
+    def infer(self, prompts: List[str], max_tokens: int = None, temperature: float = 0.7,
+              extra_body: Optional[Dict] = None) -> List[Dict]:
         """
         执行推理，返回包含延迟指标的结果
 
@@ -151,7 +208,7 @@ class LLMInferencer:
         服务模式：使用 OpenAI 兼容 API 的流式输出准确测量 TTFT/TBT
         """
         if self.use_service:
-            return self._infer_service(prompts, max_tokens, temperature)
+            return self._infer_service(prompts, max_tokens, temperature, extra_body=extra_body)
         else:
             return self._infer_offline(prompts, max_tokens, temperature)
 
@@ -220,86 +277,194 @@ class LLMInferencer:
 
         return results
 
-    def _infer_service(self, prompts: List[str], max_tokens: int = 100, temperature: float = 0.7) -> List[Dict]:
+    def infer_concurrent(self, prompts: List[str], max_tokens: int = 100, temperature: float = 0.7,
+                         extra_body: Optional[Dict] = None) -> List[Dict]:
+        """
+        服务模式下并发发起多个请求，用于触发 vLLM 在线 batching。
+
+        返回结果顺序与输入 prompts 保持一致。
+        """
+        if not self.use_service:
+            return self.infer(prompts, max_tokens=max_tokens, temperature=temperature)
+
+        results: List[Optional[Dict]] = [None] * len(prompts)
+        start_event = threading.Event()
+
+        def run_single(index: int, prompt: str):
+            client = self._create_service_client()
+            start_event.wait()
+            result = self._infer_service_single(
+                prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                client=client,
+                extra_body=extra_body,
+            )
+            result["request_index"] = index
+            return index, result
+
+        with ThreadPoolExecutor(max_workers=max(1, len(prompts))) as executor:
+            futures = [
+                executor.submit(run_single, index, prompt)
+                for index, prompt in enumerate(prompts)
+            ]
+            time.sleep(0.05)
+            start_event.set()
+
+            for future in as_completed(futures):
+                index, result = future.result()
+                results[index] = result
+
+        return [result for result in results if result is not None]
+
+    def _infer_service(self, prompts: List[str], max_tokens: int = 100, temperature: float = 0.7,
+                       extra_body: Optional[Dict] = None) -> List[Dict]:
         """服务模式推理：流式 API 准确测量"""
         results = []
 
         for prompt in prompts:
-            first_token_time = None
-            full_start = time.time()
-            token_times = []
-            generated_text = ""
-
-            try:
-                # 使用流式 API
-                response = self.client.chat.completions.create(
-                    model=self.model_name,
-                    messages=[
-                        {"role": "user", "content": prompt}
-                    ],
+            results.append(
+                self._infer_service_single(
+                    prompt,
                     max_tokens=max_tokens,
                     temperature=temperature,
-                    stream=True
+                    client=self.client,
+                    extra_body=extra_body,
                 )
-
-                for chunk in response:
-                    current_time = time.time()
-                    if first_token_time is None:
-                        first_token_time = current_time
-                    token_times.append(current_time)
-
-                    if chunk.choices[0].delta.content:
-                        generated_text += chunk.choices[0].delta.content
-
-            except Exception as e:
-                print(f"警告: 推理失败: {e}")
-                # 回退到非流式方法
-                full_start = time.time()
-                response = self.client.chat.completions.create(
-                    model=self.model_name,
-                    messages=[{"role": "user", "content": prompt}],
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    stream=False
-                )
-                full_end = time.time()
-                first_token_time = full_end
-                token_times = [full_end]
-                generated_text = response.choices[0].message.content or ""
-
-            full_end = time.time()
-            token_count = len(token_times)
-
-            # 计算延迟指标
-            e2e = (full_end - full_start) * 1000
-
-            if first_token_time is not None:
-                ttft = (first_token_time - full_start) * 1000
-            else:
-                ttft = e2e
-
-            # 计算平均 TBT
-            avg_tbt = 0.0
-            if len(token_times) > 1:
-                tbts = []
-                for i in range(1, len(token_times)):
-                    tbt = (token_times[i] - token_times[i-1]) * 1000
-                    tbts.append(tbt)
-                avg_tbt = sum(tbts) / len(tbts)
-            elif token_count > 1:
-                # 降级方案
-                avg_tbt = (e2e - ttft) / (token_count - 1) if ttft < e2e else e2e / token_count
-
-            results.append({
-                "prompt": prompt,
-                "generated_text": generated_text,
-                "token_count": token_count,
-                "ttft": ttft,
-                "tbt": avg_tbt,
-                "e2e": e2e
-            })
+            )
 
         return results
+
+    def _infer_service_single(self, prompt: str, max_tokens: int = 100, temperature: float = 0.7,
+                              client=None, extra_body: Optional[Dict] = None) -> Dict:
+        """服务模式下单请求推理，返回完整时间戳信息。"""
+        client = client or self.client
+        first_token_time = None
+        full_start = time.perf_counter()
+        wall_start = time.time()
+        token_times = []
+        generated_text = ""
+        output_token_count = 0
+        first_token_wall_time = None
+
+        request_kwargs = {
+            "model": self.served_model_name,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "stream_options": {"include_usage": True},
+        }
+        if extra_body:
+            request_kwargs["extra_body"] = extra_body
+
+        try:
+            response = client.chat.completions.create(
+                **request_kwargs,
+                stream=True
+            )
+
+            for chunk in response:
+                current_time = time.perf_counter()
+                current_wall_time = time.time()
+                if getattr(chunk, "usage", None) and chunk.usage.completion_tokens is not None:
+                    output_token_count = chunk.usage.completion_tokens
+                delta = chunk.choices[0].delta.content if chunk.choices else None
+                if delta:
+                    if first_token_time is None:
+                        first_token_time = current_time
+                        first_token_wall_time = current_wall_time
+                    token_times.append(current_time)
+                    generated_text += delta
+
+        except Exception as e:
+            print(f"警告: 推理失败: {e}")
+            fallback_request_kwargs = dict(request_kwargs)
+            fallback_request_kwargs.pop("stream_options", None)
+            response = client.chat.completions.create(
+                **fallback_request_kwargs,
+                stream=False
+            )
+            full_end = time.perf_counter()
+            wall_end = time.time()
+            first_token_time = full_end
+            first_token_wall_time = wall_end
+            token_times = [full_end] if (response.choices and response.choices[0].message.content) else []
+            generated_text = response.choices[0].message.content or ""
+            if getattr(response, "usage", None) and response.usage.completion_tokens is not None:
+                output_token_count = response.usage.completion_tokens
+            return self._build_service_result(
+                prompt=prompt,
+                generated_text=generated_text,
+                full_start=full_start,
+                full_end=full_end,
+                first_token_time=first_token_time,
+                token_times=token_times,
+                output_token_count=output_token_count,
+                wall_start=wall_start,
+                wall_end=wall_end,
+                first_token_wall_time=first_token_wall_time,
+            )
+
+        full_end = time.perf_counter()
+        wall_end = time.time()
+        return self._build_service_result(
+            prompt=prompt,
+            generated_text=generated_text,
+            full_start=full_start,
+            full_end=full_end,
+            first_token_time=first_token_time,
+            token_times=token_times,
+            output_token_count=output_token_count,
+            wall_start=wall_start,
+            wall_end=wall_end,
+            first_token_wall_time=first_token_wall_time,
+        )
+
+    def _build_service_result(self, prompt: str, generated_text: str, full_start: float, full_end: float,
+                              first_token_time: Optional[float], token_times: List[float],
+                              output_token_count: int = 0,
+                              wall_start: Optional[float] = None,
+                              wall_end: Optional[float] = None,
+                              first_token_wall_time: Optional[float] = None) -> Dict:
+        """整理服务模式的延迟结果。"""
+        token_count = output_token_count if output_token_count > 0 else self._count_generated_tokens(generated_text)
+        chunk_count = len(token_times)
+        e2e = (full_end - full_start) * 1000
+
+        if first_token_time is not None:
+            ttft = (first_token_time - full_start) * 1000
+        else:
+            ttft = e2e
+
+        itls = []
+        if chunk_count > 1:
+            for i in range(1, chunk_count):
+                itls.append((token_times[i] - token_times[i - 1]) * 1000)
+
+        avg_itl = sum(itls) / len(itls) if itls else 0.0
+        tpot = 0.0
+        if token_count > 1:
+            tpot = (e2e - ttft) / (token_count - 1) if ttft < e2e else e2e / token_count
+
+        return {
+            "prompt": prompt,
+            "generated_text": generated_text,
+            "token_count": token_count,
+            "ttft": ttft,
+            "tbt": tpot,
+            "tpot": tpot,
+            "avg_itl": avg_itl,
+            "itls": itls,
+            "e2e": e2e,
+            "start_time": full_start,
+            "end_time": full_end,
+            "first_token_time": first_token_time,
+            "start_time_wall": wall_start,
+            "end_time_wall": wall_end,
+            "first_token_time_wall": first_token_wall_time,
+            "token_times": token_times,
+            "stream_chunk_count": chunk_count,
+        }
 
     def infer_prefill_only(self, prompts: List[str], max_tokens: int = 1) -> List[Dict]:
         """
@@ -351,7 +516,7 @@ class LLMInferencer:
         for prompt in prompts:
             start = time.time()
             response = self.client.chat.completions.create(
-                model=self.model_name,
+                model=self.served_model_name,
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=max_tokens,
                 temperature=0.7,
@@ -381,4 +546,3 @@ if __name__ == "__main__":
     results = inferencer.infer(["你好"])
     print(f"推理结果: {results[0]['generated_text'][:100]}...")
     print(f"TTFT: {results[0]['ttft']:.2f}ms, TBT: {results[0]['tbt']:.2f}ms")
-

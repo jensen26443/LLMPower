@@ -1,56 +1,107 @@
-
 """
-测试使用 OpenAI 兼容 API 的 TTFT/TBT 测量方法
+测试使用 OpenAI 兼容 API 的 TTFT/TPOT/E2E 测量方法。
+
 需要先启动 vLLM 服务：
 bash start_vllm_server.sh
 """
+
+import argparse
+import statistics
+from typing import Iterable, List
+
 from llm_inference import LLMInferencer
-import time
-import random
+from load_generator import LoadGenerator
+
+
+def percentile(values: Iterable[float], p: float) -> float:
+    """使用线性插值计算百分位数，尽量贴近 bench serve 的输出方式。"""
+    sorted_values = sorted(values)
+    if not sorted_values:
+        return 0.0
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+
+    rank = (len(sorted_values) - 1) * (p / 100.0)
+    lower = int(rank)
+    upper = min(lower + 1, len(sorted_values) - 1)
+    weight = rank - lower
+    return sorted_values[lower] * (1.0 - weight) + sorted_values[upper] * weight
+
+
+def print_metric_summary(name: str, values: List[float]):
+    """打印 mean/p50/p95/p99 汇总。"""
+    print(f"{name}:")
+    print(f"  mean: {statistics.mean(values):.2f} ms" if values else "  mean: 0.00 ms")
+    print(f"  p50:  {percentile(values, 50):.2f} ms")
+    print(f"  p95:  {percentile(values, 95):.2f} ms")
+    print(f"  p99:  {percentile(values, 99):.2f} ms")
+
+
+def build_prompts(load_generator: LoadGenerator, num_prompts: int, input_len: int) -> List[str]:
+    """生成一批接近指定输入长度的唯一 prompt。"""
+    prompts = []
+    for _ in range(num_prompts):
+        prompts.append(
+            load_generator.generate_prompt_by_token_count(
+                input_len,
+                prefer_sharegpt=True,
+                add_unique_prefix=True,
+            )
+        )
+    return prompts
 
 
 def main():
-    print("测试 OpenAI 兼容 API 的 TTFT/TBT 测量")
+    parser = argparse.ArgumentParser(description="测试 OpenAI API 模式下的 TTFT/TPOT/E2E 测量")
+    parser.add_argument("--base-url", type=str, default="http://localhost:8000/v1", help="vLLM 服务地址")
+    parser.add_argument("--model-name", type=str, default="Qwen2.5-7B-Instruct-AWQ", help="模型名称或路径")
+    parser.add_argument("--warmup", type=int, default=5, help="预热请求数")
+    parser.add_argument("--num-prompts", type=int, default=20, help="正式测试请求数")
+    parser.add_argument("--input-len", type=int, default=32, help="目标输入 token 数")
+    parser.add_argument("--max-tokens", type=int, default=50, help="最大输出 token 数")
+    args = parser.parse_args()
+
+    print("测试 OpenAI 兼容 API 的 TTFT/TPOT/E2E 测量")
     print("=" * 60)
 
-    # 初始化推理器（使用服务模式，不自动启动服务）
     print("\n正在连接 vLLM 服务...")
     inferencer = LLMInferencer(
-        model_name="Qwen2.5-7B-Instruct-AWQ",
+        model_name=args.model_name,
+        served_model_name=args.model_name,
         use_service=True,
-        base_url="http://localhost:8000/v1",
-        start_server=False
+        base_url=args.base_url,
+        start_server=False,
     )
+    load_generator = LoadGenerator(tokenizer_name=args.model_name)
 
-    # 测试 prompts - 添加随机后缀避免前缀缓存命中
-    random_suffix1 = f" [随机ID:{random.randint(100000, 999999)}]"
-    random_suffix2 = f" [随机ID:{random.randint(100000, 999999)}]"
-    test_prompts = [
-        f"{random_suffix1}你好，请介绍一下你自己。",
-        f"{random_suffix2}什么是深度学习？请用简单的语言解释。",
-    ]
+    print("\n生成测试 prompts...")
+    warmup_prompts = build_prompts(load_generator, args.warmup, args.input_len)
+    test_prompts = build_prompts(load_generator, args.num_prompts, args.input_len)
 
-    print("\n开始推理测试...")
+    if args.warmup > 0:
+        print(f"\n开始预热 {args.warmup} 次...")
+        inferencer.infer(warmup_prompts, max_tokens=args.max_tokens)
+
+    print(f"\n开始正式测试，共 {args.num_prompts} 个请求...")
     print("-" * 60)
+    results = inferencer.infer(test_prompts, max_tokens=args.max_tokens)
 
-    results = inferencer.infer(test_prompts, max_tokens=50)
+    ttfts = [res["ttft"] for res in results]
+    tpots = [res["tpot"] for res in results]
+    e2es = [res["e2e"] for res in results]
+    token_counts = [res["token_count"] for res in results]
 
-    for i, res in enumerate(results):
-        print(f"\nPrompt {i+1}: {test_prompts[i][:50]}...")
-        print(f"  Token 数量: {res['token_count']}")
-        print(f"  TTFT: {res['ttft']:.2f} ms")
-        print(f"  TBT:  {res['tbt']:.2f} ms")
-        print(f"  E2E:  {res['e2e']:.2f} ms")
-        if res['tbt'] > 0:
-            print(f"  TTFT/TBT 比率: {res['ttft']/res['tbt']:.2f}x")
+    print(f"请求数: {len(results)}")
+    print(f"平均输出 token 数: {statistics.mean(token_counts):.2f}" if token_counts else "平均输出 token 数: 0.00")
+    print_metric_summary("TTFT", ttfts)
+    print_metric_summary("TPOT", tpots)
+    print_metric_summary("E2E", e2es)
 
-    print("\n" + "=" * 60)
-    print("预期结果：")
-    print("  - TTFT 应该远大于 TBT（通常 2-10 倍）")
-    print("  - TBT 不应该是 0")
-    print("  - E2E ≈ TTFT + TBT × (token_count - 1)")
+    print("\n前 3 个样本:")
+    for i, res in enumerate(results[:3]):
+        print(f"  Sample {i + 1}: tokens={res['token_count']}, ttft={res['ttft']:.2f} ms, "
+              f"tpot={res['tpot']:.2f} ms, e2e={res['e2e']:.2f} ms")
 
 
 if __name__ == "__main__":
     main()
-

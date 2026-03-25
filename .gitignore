@@ -68,3 +68,22 @@ input/
 
 # Experiment results
 results/prefill_modeling/
+
+# Local-only docs and notes
+CLAUDE.md
+AGENTS.md
+TTFT_ISSUE_ANALYSIS.md
+request.md
+idea*.md
+docs/
+papersummary/
+
+# Local-only test scripts
+test_load.py
+test_prefill_system.py
+test_ttft_fix.py
+test_ttft_simple.py
+
+# Local-only experiment outputs
+results_decode/
+openai-chat-*.json

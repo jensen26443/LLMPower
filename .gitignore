@@ -84,6 +84,18 @@ test_prefill_system.py
 test_ttft_fix.py
 test_ttft_simple.py
 
+# Local-only utility scripts
+adapt_to_server.py
+download_sharegpt.py
+merge_bucket1.py
+merge_results.py
+package_for_server.sh
+reanalyze_power_data.py
+run_175w_experiments.sh
+run_all_fixed_experiments.sh
+run_bucket1_only.sh
+run_with_sudo.py
+
 # Local-only experiment outputs
 results_decode/
 openai-chat-*.json

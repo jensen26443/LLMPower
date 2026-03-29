@@ -15,6 +15,7 @@ TBT = g(B, KV)
 """
 import argparse
 import csv
+import json
 import math
 import os
 import random
@@ -29,6 +30,12 @@ from llm_inference import LLMInferencer
 from load_generator import LoadGenerator
 from monitor import PowerMonitor
 from power_control import get_power_cap, set_power_cap
+
+DEFAULT_ENABLE_CHUNKED_PREFILL = True
+DEFAULT_MAX_NUM_BATCHED_TOKENS = 2048
+DEFAULT_MAX_NUM_SEQS = 64
+DEFAULT_QUEUE_SEED = 20260329
+DEFAULT_SAMPLING_SEED = 20260329
 
 
 def percentile(values: List[float], p: float) -> float:
@@ -64,6 +71,63 @@ def summarize_metric(values: List[float], prefix: str) -> Dict:
         f"p50_{prefix}_ms": percentile(values, 50),
         f"p95_{prefix}_ms": percentile(values, 95),
         f"p99_{prefix}_ms": percentile(values, 99),
+    }
+
+
+def build_scheduler_signature(enable_chunked_prefill: bool,
+                              max_num_batched_tokens: int,
+                              max_num_seqs: int) -> str:
+    return (
+        f"cp{1 if enable_chunked_prefill else 0}"
+        f"_mbt{max_num_batched_tokens}"
+        f"_mns{max_num_seqs}"
+    )
+
+
+def build_experiment_metadata(enable_chunked_prefill: bool,
+                              max_num_batched_tokens: int,
+                              max_num_seqs: int,
+                              queue_seed: int,
+                              sampling_seed: int) -> Dict:
+    return {
+        "enable_chunked_prefill": enable_chunked_prefill,
+        "max_num_batched_tokens": max_num_batched_tokens,
+        "max_num_seqs": max_num_seqs,
+        "queue_seed": queue_seed,
+        "sampling_seed": sampling_seed,
+        "scheduler_signature": build_scheduler_signature(
+            enable_chunked_prefill,
+            max_num_batched_tokens,
+            max_num_seqs,
+        ),
+    }
+
+
+def build_experiment_id(prefix: str, metadata: Dict, timestamp: int) -> str:
+    return f"{prefix}_{metadata['scheduler_signature']}_{timestamp}"
+
+
+def build_experiment_queue(batch_sizes: List[int],
+                           output_lengths: List[int],
+                           repeats: int,
+                           queue_seed: int) -> List[Tuple[int, int, int]]:
+    queue = []
+    for batch_size in batch_sizes:
+        for output_length in output_lengths:
+            for repeat_id in range(1, repeats + 1):
+                queue.append((batch_size, output_length, repeat_id))
+
+    rng = random.Random(queue_seed)
+    rng.shuffle(queue)
+    return queue
+
+
+def build_decode_request_extra_body(output_length: int, sampling_seed: int) -> Dict:
+    return {
+        "min_tokens": output_length,
+        "ignore_eos": True,
+        "top_p": 1.0,
+        "seed": sampling_seed,
     }
 
 
@@ -172,6 +236,21 @@ def estimate_request_tbt_ms(request_result: Dict, output_tokens: int) -> float:
     return request_result.get("tbt", 0.0)
 
 
+def build_request_diagnostics(request_result: Dict) -> Dict[str, float]:
+    ttft_ms = float(request_result.get("ttft", 0.0) or 0.0)
+    e2e_ms = float(request_result.get("e2e", 0.0) or 0.0)
+    decode_duration_ms = max(0.0, e2e_ms - ttft_ms)
+    avg_itl_ms = float(request_result.get("avg_itl", 0.0) or 0.0)
+    stream_chunk_count = int(request_result.get("stream_chunk_count", 0) or 0)
+    ttft_ratio = (ttft_ms / e2e_ms) if e2e_ms > 0 else 0.0
+    return {
+        "avg_itl_ms": avg_itl_ms,
+        "stream_chunk_count": stream_chunk_count,
+        "ttft_ratio": ttft_ratio,
+        "decode_duration_ms": decode_duration_ms,
+    }
+
+
 def summarize_batch(index: int, repeat_id: int, batch_size: int, target_output_tokens: int,
                     prompt_token_count: int, request_results: List[Dict],
                     tokenizer: LoadGenerator) -> Tuple[Dict, List[Dict]]:
@@ -181,6 +260,10 @@ def summarize_batch(index: int, repeat_id: int, batch_size: int, target_output_t
     ttfts = []
     tbts = []
     e2es = []
+    avg_itls = []
+    stream_chunk_counts = []
+    ttft_ratios = []
+    decode_durations = []
     start_times = []
     end_times = []
     first_token_times = []
@@ -190,6 +273,7 @@ def summarize_batch(index: int, repeat_id: int, batch_size: int, target_output_t
         if output_tokens <= 0 and request_result["generated_text"]:
             output_tokens = tokenizer.count_tokens(request_result["generated_text"])
         request_tbt = estimate_request_tbt_ms(request_result, output_tokens)
+        diagnostics = build_request_diagnostics(request_result)
         request_start_time = request_result.get("start_time_wall", request_result["start_time"])
         request_end_time = request_result.get("end_time_wall", request_result["end_time"])
         decode_start_time = request_result.get("first_token_time_wall") or request_end_time
@@ -198,6 +282,10 @@ def summarize_batch(index: int, repeat_id: int, batch_size: int, target_output_t
         ttfts.append(request_result["ttft"])
         tbts.append(request_tbt)
         e2es.append(request_result["e2e"])
+        avg_itls.append(diagnostics["avg_itl_ms"])
+        stream_chunk_counts.append(diagnostics["stream_chunk_count"])
+        ttft_ratios.append(diagnostics["ttft_ratio"])
+        decode_durations.append(diagnostics["decode_duration_ms"])
         start_times.append(request_start_time)
         end_times.append(request_end_time)
         first_token_times.append(decode_start_time)
@@ -213,6 +301,10 @@ def summarize_batch(index: int, repeat_id: int, batch_size: int, target_output_t
             "ttft_ms": request_result["ttft"],
             "tbt_ms": request_tbt,
             "e2e_ms": request_result["e2e"],
+            "avg_itl_ms": diagnostics["avg_itl_ms"],
+            "stream_chunk_count": diagnostics["stream_chunk_count"],
+            "ttft_ratio": diagnostics["ttft_ratio"],
+            "decode_duration_ms": diagnostics["decode_duration_ms"],
             "request_start_time": request_start_time,
             "first_token_time": decode_start_time,
             "request_end_time": request_end_time,
@@ -234,6 +326,12 @@ def summarize_batch(index: int, repeat_id: int, batch_size: int, target_output_t
         "avg_generated_tokens": avg_generated_tokens,
         "min_generated_tokens": min(generated_token_counts) if generated_token_counts else 0,
         "max_generated_tokens": max(generated_token_counts) if generated_token_counts else 0,
+        "avg_stream_chunk_count": statistics.mean(stream_chunk_counts) if stream_chunk_counts else 0.0,
+        "min_stream_chunk_count": min(stream_chunk_counts) if stream_chunk_counts else 0,
+        "max_stream_chunk_count": max(stream_chunk_counts) if stream_chunk_counts else 0,
+        "avg_request_avg_itl_ms": statistics.mean(avg_itls) if avg_itls else 0.0,
+        "avg_ttft_ratio": statistics.mean(ttft_ratios) if ttft_ratios else 0.0,
+        "avg_decode_duration_ms": statistics.mean(decode_durations) if decode_durations else 0.0,
         "max_ttft_ms": max(ttfts) if ttfts else 0.0,
         "batch_start_time": min(start_times) if start_times else 0.0,
         "batch_end_time": max(end_times) if end_times else 0.0,
@@ -252,7 +350,7 @@ def summarize_batch(index: int, repeat_id: int, batch_size: int, target_output_t
     return batch_row, request_rows
 
 
-def aggregate_results(batch_results: List[Dict], request_results: List[Dict]) -> List[Dict]:
+def aggregate_results(batch_results: List[Dict], request_results: List[Dict], metadata: Dict) -> List[Dict]:
     """按 batch size 和输出长度聚合结果。"""
     batch_grouped: Dict[Tuple[int, int], List[Dict]] = defaultdict(list)
     request_grouped: Dict[Tuple[int, int], List[Dict]] = defaultdict(list)
@@ -269,6 +367,10 @@ def aggregate_results(batch_results: List[Dict], request_results: List[Dict]) ->
         ttfts = [row["ttft_ms"] for row in request_group]
         tbts = [row["tbt_ms"] for row in request_group]
         e2es = [row["e2e_ms"] for row in request_group]
+        avg_itls = [row["avg_itl_ms"] for row in request_group]
+        stream_chunk_counts = [row["stream_chunk_count"] for row in request_group]
+        ttft_ratios = [row["ttft_ratio"] for row in request_group]
+        decode_durations = [row["decode_duration_ms"] for row in request_group]
 
         aggregated_row = {
             "batch_size": batch_size,
@@ -289,11 +391,20 @@ def aggregate_results(batch_results: List[Dict], request_results: List[Dict]) ->
             "std_ttft_ms": statistics.stdev(ttfts) if len(ttfts) > 1 else 0.0,
             "std_tbt_ms": statistics.stdev(tbts) if len(tbts) > 1 else 0.0,
             "std_e2e_ms": statistics.stdev(e2es) if len(e2es) > 1 else 0.0,
+            "avg_stream_chunk_count": statistics.mean(stream_chunk_counts) if stream_chunk_counts else 0.0,
+            "std_stream_chunk_count": statistics.stdev(stream_chunk_counts) if len(stream_chunk_counts) > 1 else 0.0,
+            "avg_request_avg_itl_ms": statistics.mean(avg_itls) if avg_itls else 0.0,
+            "std_request_avg_itl_ms": statistics.stdev(avg_itls) if len(avg_itls) > 1 else 0.0,
+            "avg_ttft_ratio": statistics.mean(ttft_ratios) if ttft_ratios else 0.0,
+            "std_ttft_ratio": statistics.stdev(ttft_ratios) if len(ttft_ratios) > 1 else 0.0,
+            "avg_decode_duration_ms": statistics.mean(decode_durations) if decode_durations else 0.0,
+            "std_decode_duration_ms": statistics.stdev(decode_durations) if len(decode_durations) > 1 else 0.0,
             "avg_context_total_tokens": statistics.mean(row["context_total_tokens"] for row in batch_group),
             "avg_approx_kv_pressure": statistics.mean(row["approx_kv_pressure"] for row in batch_group),
             "avg_normalized_kv_blocks": statistics.mean(row["normalized_kv_blocks"] for row in batch_group),
             "avg_idle_baseline_w": statistics.mean(row["idle_baseline_w"] for row in batch_group),
         }
+        aggregated_row.update(metadata)
         aggregated_row.update(summarize_metric(ttfts, "ttft"))
         aggregated_row.update(summarize_metric(tbts, "tbt"))
         aggregated_row.update(summarize_metric(e2es, "e2e"))
@@ -358,6 +469,11 @@ def run_decode_experiment(batch_sizes: List[int],
                           time_padding_ms: float = 20.0,
                           max_retries: int = 6,
                           retry_backoff_sec: float = 2.0,
+                          enable_chunked_prefill: bool = DEFAULT_ENABLE_CHUNKED_PREFILL,
+                          max_num_batched_tokens: int = DEFAULT_MAX_NUM_BATCHED_TOKENS,
+                          max_num_seqs: int = DEFAULT_MAX_NUM_SEQS,
+                          queue_seed: int = DEFAULT_QUEUE_SEED,
+                          sampling_seed: int = DEFAULT_SAMPLING_SEED,
                           sudo_password: Optional[str] = None,
                           skip_set_power: bool = False):
     """运行解码阶段离线建模实验。"""
@@ -385,8 +501,19 @@ def run_decode_experiment(batch_sizes: List[int],
         start_server=start_server,
         gpu_memory_utilization=gpu_memory_utilization,
         disable_prefix_caching=True,
+        service_request_mode="completion",
+        enable_chunked_prefill=enable_chunked_prefill,
+        max_num_batched_tokens=max_num_batched_tokens,
+        max_num_seqs=max_num_seqs,
     )
     load_generator = LoadGenerator(sharegpt_dir="", tokenizer_name=tokenizer_path)
+    experiment_metadata = build_experiment_metadata(
+        enable_chunked_prefill=enable_chunked_prefill,
+        max_num_batched_tokens=max_num_batched_tokens,
+        max_num_seqs=max_num_seqs,
+        queue_seed=queue_seed,
+        sampling_seed=sampling_seed,
+    )
 
     base_prompt = load_generator.generate_prompt_by_token_count(
         prompt_token_count,
@@ -396,10 +523,20 @@ def run_decode_experiment(batch_sizes: List[int],
     actual_prompt_tokens = load_generator.count_tokens(base_prompt)
     print(f"实验 prompt token 数: 目标={prompt_token_count}, 实际={actual_prompt_tokens}")
     print(f"实验 prompt 预览: {base_prompt[:50]}")
+    print(
+        "调度参数: "
+        f"chunked_prefill={enable_chunked_prefill}, "
+        f"max_num_batched_tokens={max_num_batched_tokens}, "
+        f"max_num_seqs={max_num_seqs}, "
+        f"queue_seed={queue_seed}, sampling_seed={sampling_seed}"
+    )
 
     print("预热服务...")
     warmup_prompts = [base_prompt] * min(4, max(batch_sizes))
-    warmup_extra_body = {"min_tokens": min(16, max(output_lengths)), "ignore_eos": True}
+    warmup_extra_body = build_decode_request_extra_body(
+        output_length=min(16, max(output_lengths)),
+        sampling_seed=sampling_seed,
+    )
     for _ in range(2):
         infer_concurrent_with_retry(
             inferencer,
@@ -413,12 +550,12 @@ def run_decode_experiment(batch_sizes: List[int],
         )
     time.sleep(2)
 
-    experiment_queue = []
-    for batch_size in batch_sizes:
-        for output_length in output_lengths:
-            for repeat_id in range(1, repeats + 1):
-                experiment_queue.append((batch_size, output_length, repeat_id))
-    random.shuffle(experiment_queue)
+    experiment_queue = build_experiment_queue(
+        batch_sizes=batch_sizes,
+        output_lengths=output_lengths,
+        repeats=repeats,
+        queue_seed=queue_seed,
+    )
 
     print(
         f"\n实验队列已构建：{len(batch_sizes)} 个 batch size × "
@@ -440,10 +577,10 @@ def run_decode_experiment(batch_sizes: List[int],
 
     for index, (batch_size, output_length, repeat_id) in enumerate(tqdm(experiment_queue, desc="解码实验中")):
         prompts = [base_prompt] * batch_size
-        extra_body = {
-            "min_tokens": output_length,
-            "ignore_eos": True,
-        }
+        extra_body = build_decode_request_extra_body(
+            output_length=output_length,
+            sampling_seed=sampling_seed,
+        )
         inference_results = infer_concurrent_with_retry(
             inferencer,
             prompts,
@@ -464,6 +601,9 @@ def run_decode_experiment(batch_sizes: List[int],
             request_results=inference_results,
             tokenizer=load_generator,
         )
+        batch_row.update(experiment_metadata)
+        for request_row in request_rows:
+            request_row.update(experiment_metadata)
         batch_results.append(batch_row)
         request_results.extend(request_rows)
         time.sleep(max(0.0, inter_batch_sec))
@@ -478,13 +618,18 @@ def run_decode_experiment(batch_sizes: List[int],
         experiment_start_time=experiment_start_time,
         time_padding_ms=time_padding_ms,
     )
-    aggregated_results = aggregate_results(final_batch_results, request_results)
+    aggregated_results = aggregate_results(final_batch_results, request_results, experiment_metadata)
 
-    experiment_id = f"decode_modeling_service_{int(time.time())}"
+    experiment_id = build_experiment_id(
+        prefix="decode_modeling_service",
+        metadata=experiment_metadata,
+        timestamp=int(time.time()),
+    )
     timeline_file = os.path.join(output_dir, f"{experiment_id}_power_timeline.csv")
     raw_batch_file = os.path.join(output_dir, f"{experiment_id}_raw.csv")
     raw_request_file = os.path.join(output_dir, f"{experiment_id}_requests.csv")
     aggregated_file = os.path.join(output_dir, f"{experiment_id}_aggregated.csv")
+    metadata_file = os.path.join(output_dir, f"{experiment_id}_metadata.json")
 
     timeline_rows = [
         {
@@ -507,7 +652,11 @@ def run_decode_experiment(batch_sizes: List[int],
         final_batch_results,
         [
             "index", "repeat_id", "batch_size", "target_output_tokens", "prompt_token_count",
+            "enable_chunked_prefill", "max_num_batched_tokens", "max_num_seqs",
+            "queue_seed", "sampling_seed", "scheduler_signature",
             "avg_generated_tokens", "min_generated_tokens", "max_generated_tokens",
+            "avg_stream_chunk_count", "min_stream_chunk_count", "max_stream_chunk_count",
+            "avg_request_avg_itl_ms", "avg_ttft_ratio", "avg_decode_duration_ms",
             "avg_ttft_ms", "mean_ttft_ms", "p50_ttft_ms", "p95_ttft_ms", "p99_ttft_ms", "max_ttft_ms",
             "avg_tbt_ms", "mean_tbt_ms", "p50_tbt_ms", "p95_tbt_ms", "p99_tbt_ms",
             "avg_e2e_ms", "mean_e2e_ms", "p50_e2e_ms", "p95_e2e_ms", "p99_e2e_ms",
@@ -524,7 +673,10 @@ def run_decode_experiment(batch_sizes: List[int],
         request_results,
         [
             "batch_index", "repeat_id", "request_index", "batch_size", "target_output_tokens",
+            "enable_chunked_prefill", "max_num_batched_tokens", "max_num_seqs",
+            "queue_seed", "sampling_seed", "scheduler_signature",
             "prompt_token_count", "actual_output_tokens", "ttft_ms", "tbt_ms", "e2e_ms",
+            "avg_itl_ms", "stream_chunk_count", "ttft_ratio", "decode_duration_ms",
             "request_start_time", "first_token_time", "request_end_time", "generated_preview",
         ],
     )
@@ -534,7 +686,13 @@ def run_decode_experiment(batch_sizes: List[int],
         aggregated_results,
         [
             "batch_size", "target_output_tokens", "count", "request_count",
+            "enable_chunked_prefill", "max_num_batched_tokens", "max_num_seqs",
+            "queue_seed", "sampling_seed", "scheduler_signature",
             "avg_generated_tokens", "std_generated_tokens",
+            "avg_stream_chunk_count", "std_stream_chunk_count",
+            "avg_request_avg_itl_ms", "std_request_avg_itl_ms",
+            "avg_ttft_ratio", "std_ttft_ratio",
+            "avg_decode_duration_ms", "std_decode_duration_ms",
             "avg_power_w", "std_power_w", "peak_power_w",
             "avg_energy_j", "std_energy_j",
             "avg_dynamic_power_w", "std_dynamic_power_w",
@@ -547,6 +705,9 @@ def run_decode_experiment(batch_sizes: List[int],
         ],
     )
 
+    with open(metadata_file, "w", encoding="utf-8") as file_obj:
+        json.dump(experiment_metadata, file_obj, ensure_ascii=False, indent=2)
+
     print("\n实验完成！")
     print(f"总耗时: {total_duration:.1f}s")
     print(f"功率采样点: {len(power_data)}")
@@ -554,6 +715,7 @@ def run_decode_experiment(batch_sizes: List[int],
     print(f"请求级原始数据: {raw_request_file}")
     print(f"聚合数据: {aggregated_file}")
     print(f"功率时间线: {timeline_file}")
+    print(f"实验元数据: {metadata_file}")
     if aggregated_results:
         sample_row = aggregated_results[0]
         print(
@@ -581,7 +743,7 @@ def parse_int_list(raw_value: str) -> List[int]:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="解码阶段离线建模实验（vLLM 在线服务模式）")
-    parser.add_argument("--batch-sizes", type=str, default="1,4,8,16,32,50,64",
+    parser.add_argument("--batch-sizes", type=str, default="1,2,4,6,8,12,16,24,32,40,48,50,56,60,64",
                         help="batch size 列表，逗号分隔")
     parser.add_argument("--output-lengths", type=str, default="10,20,40,50,75,100,150,200,300",
                         help="输出长度列表，逗号分隔")
@@ -617,6 +779,16 @@ if __name__ == "__main__":
                         help="单次推理失败后的最大重试次数")
     parser.add_argument("--retry-backoff-sec", type=float, default=2.0,
                         help="失败重试的线性退避基准秒数")
+    parser.add_argument("--enable-chunked-prefill", action="store_true", default=DEFAULT_ENABLE_CHUNKED_PREFILL,
+                        help="显式启用 vLLM chunked prefill")
+    parser.add_argument("--max-num-batched-tokens", type=int, default=DEFAULT_MAX_NUM_BATCHED_TOKENS,
+                        help="显式固定 vLLM max_num_batched_tokens")
+    parser.add_argument("--max-num-seqs", type=int, default=DEFAULT_MAX_NUM_SEQS,
+                        help="显式固定 vLLM max_num_seqs")
+    parser.add_argument("--queue-seed", type=int, default=DEFAULT_QUEUE_SEED,
+                        help="实验队列随机种子")
+    parser.add_argument("--sampling-seed", type=int, default=DEFAULT_SAMPLING_SEED,
+                        help="请求采样种子")
     parser.add_argument("--sudo-password", type=str, default=None,
                         help="sudo 密码（用于自动设置功率）")
     parser.add_argument("--skip-set-power", action="store_true",
@@ -643,6 +815,11 @@ if __name__ == "__main__":
         time_padding_ms=args.time_padding_ms,
         max_retries=args.max_retries,
         retry_backoff_sec=args.retry_backoff_sec,
+        enable_chunked_prefill=args.enable_chunked_prefill,
+        max_num_batched_tokens=args.max_num_batched_tokens,
+        max_num_seqs=args.max_num_seqs,
+        queue_seed=args.queue_seed,
+        sampling_seed=args.sampling_seed,
         sudo_password=args.sudo_password,
         skip_set_power=args.skip_set_power,
     )

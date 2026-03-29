@@ -5,7 +5,7 @@
 生成：
 - batch size / normalized KV blocks vs decoding power 热力图
 - batch size / normalized KV blocks vs TBT 热力图
-- batch size vs TBT 趋势图
+- batch size vs TBT 平均值 / P50 / P95 / P99 趋势图
 - normalized KV blocks vs decoding power 趋势图
 """
 import glob
@@ -155,19 +155,25 @@ def plot_heatmap(df: pd.DataFrame, value_col: str, title: str, output_path: str,
     plt.close()
 
 
-def plot_tbt_by_batch(df: pd.DataFrame, output_path: str):
+def plot_tbt_metric_by_batch(
+    df: pd.DataFrame,
+    metric_col: str,
+    title: str,
+    ylabel: str,
+    output_path: str,
+):
     plt.figure(figsize=(11, 7))
     sns.lineplot(
         data=df,
         x="batch_size",
-        y="avg_tbt_ms",
+        y=metric_col,
         hue="target_output_tokens",
         marker="o",
         palette="tab10",
     )
-    plt.title("Batch Size vs Decode TBT", fontsize=14, pad=16)
+    plt.title(title, fontsize=14, pad=16)
     plt.xlabel("Batch Size", fontsize=12)
-    plt.ylabel("Average TBT (ms)", fontsize=12)
+    plt.ylabel(ylabel, fontsize=12)
     plt.legend(title="Target Output Tokens")
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches="tight")
@@ -243,6 +249,9 @@ def generate_report(df: pd.DataFrame, output_path: str):
         "- decode_power_heatmap.png",
         "- decode_tbt_heatmap.png",
         "- decode_tbt_by_batch.png",
+        "- decode_tbt_p50_by_batch.png",
+        "- decode_tbt_p95_by_batch.png",
+        "- decode_tbt_p99_by_batch.png",
         "- decode_power_by_kv.png",
         "- aggregated csv now includes mean/p50/p95/p99 for TTFT/TBT/E2E",
     ]
@@ -260,6 +269,9 @@ def generate_visualizations(agg_df: pd.DataFrame, raw_df: pd.DataFrame, output_d
         "power_heatmap": os.path.join(output_dir, "decode_power_heatmap.png"),
         "tbt_heatmap": os.path.join(output_dir, "decode_tbt_heatmap.png"),
         "tbt_line": os.path.join(output_dir, "decode_tbt_by_batch.png"),
+        "tbt_p50_line": os.path.join(output_dir, "decode_tbt_p50_by_batch.png"),
+        "tbt_p95_line": os.path.join(output_dir, "decode_tbt_p95_by_batch.png"),
+        "tbt_p99_line": os.path.join(output_dir, "decode_tbt_p99_by_batch.png"),
         "power_line": os.path.join(output_dir, "decode_power_by_kv.png"),
         "report": os.path.join(output_dir, "decode_modeling_report.md"),
     }
@@ -278,7 +290,34 @@ def generate_visualizations(agg_df: pd.DataFrame, raw_df: pd.DataFrame, output_d
         output_path=outputs["tbt_heatmap"],
         cmap="Blues",
     )
-    plot_tbt_by_batch(agg_plot_df, outputs["tbt_line"])
+    plot_tbt_metric_by_batch(
+        agg_plot_df,
+        metric_col="avg_tbt_ms",
+        title="Batch Size vs Decode TBT",
+        ylabel="Average TBT (ms)",
+        output_path=outputs["tbt_line"],
+    )
+    plot_tbt_metric_by_batch(
+        agg_plot_df,
+        metric_col="p50_tbt_ms",
+        title="Batch Size vs Decode TBT P50",
+        ylabel="TBT P50 (ms)",
+        output_path=outputs["tbt_p50_line"],
+    )
+    plot_tbt_metric_by_batch(
+        agg_plot_df,
+        metric_col="p95_tbt_ms",
+        title="Batch Size vs Decode TBT P95",
+        ylabel="TBT P95 (ms)",
+        output_path=outputs["tbt_p95_line"],
+    )
+    plot_tbt_metric_by_batch(
+        agg_plot_df,
+        metric_col="p99_tbt_ms",
+        title="Batch Size vs Decode TBT P99",
+        ylabel="TBT P99 (ms)",
+        output_path=outputs["tbt_p99_line"],
+    )
     plot_power_by_kv(kv_plot_df, outputs["power_line"])
     generate_report(agg_plot_df, outputs["report"])
     return outputs

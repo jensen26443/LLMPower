@@ -1,4 +1,4 @@
-
+import json
 import time
 import os
 import subprocess
@@ -21,6 +21,12 @@ try:
 except ImportError:
     OPENAI_AVAILABLE = False
 
+try:
+    import httpx
+    HAS_HTTPX = True
+except ImportError:
+    HAS_HTTPX = False
+
 # 服务模式下用于回退统计输出 token 数
 try:
     from transformers import AutoTokenizer
@@ -39,7 +45,11 @@ class LLMInferencer:
         api_key: str = "EMPTY",
         start_server: bool = False,
         gpu_memory_utilization: float = 0.85,
-        disable_prefix_caching: bool = True
+        disable_prefix_caching: bool = True,
+        service_request_mode: str = "chat",
+        enable_chunked_prefill: bool = True,
+        max_num_batched_tokens: int = 2048,
+        max_num_seqs: int = 64,
     ):
         """
         初始化推理器，支持两种模式：
@@ -56,6 +66,10 @@ class LLMInferencer:
             start_server: 是否自动启动 vLLM 服务（服务模式）
             gpu_memory_utilization: GPU 显存利用率
             disable_prefix_caching: 是否禁用前缀缓存
+            service_request_mode: 服务模式请求类型，支持 "chat" 或 "completion"
+            enable_chunked_prefill: 是否显式启用 chunked prefill
+            max_num_batched_tokens: 显式固定 max_num_batched_tokens
+            max_num_seqs: 显式固定 max_num_seqs
         """
         self.model_name = model_name
         self.served_model_name = served_model_name or model_name
@@ -67,6 +81,14 @@ class LLMInferencer:
         self.server_process: Optional[subprocess.Popen] = None
         self.base_url = base_url
         self.api_key = api_key
+        self.enable_chunked_prefill = enable_chunked_prefill
+        self.max_num_batched_tokens = max_num_batched_tokens
+        self.max_num_seqs = max_num_seqs
+        if service_request_mode not in {"chat", "completion"}:
+            raise ValueError(f"Unsupported service_request_mode: {service_request_mode}")
+        self.service_request_mode = service_request_mode
+        if self.service_request_mode == "completion" and not HAS_HTTPX:
+            raise ImportError("httpx is required for completion service mode")
 
         if use_service:
             if not OPENAI_AVAILABLE:
@@ -127,6 +149,119 @@ class LLMInferencer:
             api_key=self.api_key
         )
 
+    def _build_service_request_kwargs(
+        self,
+        prompt: str,
+        max_tokens: int,
+        temperature: float,
+        extra_body: Optional[Dict],
+        include_stream_options: bool = True,
+    ) -> Dict:
+        """按服务请求模式构造 API 参数。"""
+        if self.service_request_mode == "completion":
+            request_kwargs = {
+                "model": self.served_model_name,
+                "prompt": prompt,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "stream": include_stream_options,
+            }
+            if extra_body:
+                request_kwargs.update(extra_body)
+        else:
+            request_kwargs = {
+                "model": self.served_model_name,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+            }
+
+        if include_stream_options:
+            request_kwargs["stream_options"] = {"include_usage": True}
+        if extra_body and self.service_request_mode != "completion":
+            request_kwargs["extra_body"] = extra_body
+        return request_kwargs
+
+    def _create_service_completion(self, client, request_kwargs: Dict, stream: bool):
+        """根据请求模式发起 completions/chat.completions 请求。"""
+        return client.chat.completions.create(**request_kwargs, stream=stream)
+
+    def _build_completion_http_headers(self) -> Dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        return headers
+
+    def _iter_completion_stream_http(self, request_kwargs: Dict):
+        url = f"{self.base_url.rstrip('/')}/completions"
+        with httpx.stream(
+            "POST",
+            url,
+            headers=self._build_completion_http_headers(),
+            json=request_kwargs,
+            timeout=120.0,
+            trust_env=False,
+        ) as response:
+            response.raise_for_status()
+            for raw_line in response.iter_lines():
+                if not raw_line:
+                    continue
+                line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
+                if not line.startswith("data: "):
+                    continue
+                payload = line[6:]
+                if payload == "[DONE]":
+                    break
+                yield json.loads(payload)
+
+    def _create_completion_http(self, request_kwargs: Dict) -> Dict:
+        url = f"{self.base_url.rstrip('/')}/completions"
+        response = httpx.post(
+            url,
+            headers=self._build_completion_http_headers(),
+            json=request_kwargs,
+            timeout=120.0,
+            trust_env=False,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def _extract_stream_text(self, chunk) -> Optional[str]:
+        """从流式返回中提取当前 chunk 的文本。"""
+        if isinstance(chunk, dict):
+            choices = chunk.get("choices") or []
+            if not choices:
+                return None
+            return choices[0].get("text")
+
+        if not getattr(chunk, "choices", None):
+            return None
+
+        choice = chunk.choices[0]
+        if self.service_request_mode == "completion":
+            return getattr(choice, "text", None)
+
+        delta = getattr(choice, "delta", None)
+        return getattr(delta, "content", None) if delta is not None else None
+
+    def _extract_response_text(self, response) -> str:
+        """从非流式返回中提取文本。"""
+        if isinstance(response, dict):
+            choices = response.get("choices") or []
+            if not choices:
+                return ""
+            return choices[0].get("text", "") or ""
+
+        if not getattr(response, "choices", None):
+            return ""
+
+        choice = response.choices[0]
+        if self.service_request_mode == "completion":
+            return getattr(choice, "text", "") or ""
+
+        message = getattr(choice, "message", None)
+        return getattr(message, "content", "") if message is not None else ""
+
     def _get_tokenizer(self):
         """延迟加载 tokenizer，用于服务模式下回退统计输出 token 数。"""
         if self.tokenizer is not None or not HAS_TRANSFORMERS_TOKENIZER:
@@ -174,7 +309,11 @@ class LLMInferencer:
             "--served-model-name", self.served_model_name,
             "--quantization", "awq",
             "--gpu-memory-utilization", str(gpu_memory_utilization),
+            "--max-num-batched-tokens", str(self.max_num_batched_tokens),
+            "--max-num-seqs", str(self.max_num_seqs),
         ]
+        if self.enable_chunked_prefill:
+            cmd.append("--enable-chunked-prefill")
         if disable_prefix_caching:
             cmd.append("--no-enable-prefix-caching")
 
@@ -347,28 +486,30 @@ class LLMInferencer:
         output_token_count = 0
         first_token_wall_time = None
 
-        request_kwargs = {
-            "model": self.served_model_name,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "stream_options": {"include_usage": True},
-        }
-        if extra_body:
-            request_kwargs["extra_body"] = extra_body
+        request_kwargs = self._build_service_request_kwargs(
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            extra_body=extra_body,
+            include_stream_options=True,
+        )
 
         try:
-            response = client.chat.completions.create(
-                **request_kwargs,
-                stream=True
-            )
+            if self.service_request_mode == "completion":
+                response = self._iter_completion_stream_http(request_kwargs)
+            else:
+                response = self._create_service_completion(client, request_kwargs, stream=True)
 
             for chunk in response:
                 current_time = time.perf_counter()
                 current_wall_time = time.time()
                 if getattr(chunk, "usage", None) and chunk.usage.completion_tokens is not None:
                     output_token_count = chunk.usage.completion_tokens
-                delta = chunk.choices[0].delta.content if chunk.choices else None
+                elif isinstance(chunk, dict):
+                    usage = chunk.get("usage") or {}
+                    if usage.get("completion_tokens") is not None:
+                        output_token_count = usage["completion_tokens"]
+                delta = self._extract_stream_text(chunk)
                 if delta:
                     if first_token_time is None:
                         first_token_time = current_time
@@ -378,20 +519,30 @@ class LLMInferencer:
 
         except Exception as e:
             print(f"警告: 推理失败: {e}")
-            fallback_request_kwargs = dict(request_kwargs)
-            fallback_request_kwargs.pop("stream_options", None)
-            response = client.chat.completions.create(
-                **fallback_request_kwargs,
-                stream=False
+            fallback_request_kwargs = self._build_service_request_kwargs(
+                prompt=prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                extra_body=extra_body,
+                include_stream_options=False,
             )
+            if self.service_request_mode == "completion":
+                response = self._create_completion_http(fallback_request_kwargs)
+            else:
+                response = self._create_service_completion(client, fallback_request_kwargs, stream=False)
             full_end = time.perf_counter()
             wall_end = time.time()
             first_token_time = full_end
             first_token_wall_time = wall_end
-            token_times = [full_end] if (response.choices and response.choices[0].message.content) else []
-            generated_text = response.choices[0].message.content or ""
+            response_text = self._extract_response_text(response)
+            token_times = [full_end] if response_text else []
+            generated_text = response_text
             if getattr(response, "usage", None) and response.usage.completion_tokens is not None:
                 output_token_count = response.usage.completion_tokens
+            elif isinstance(response, dict):
+                usage = response.get("usage") or {}
+                if usage.get("completion_tokens") is not None:
+                    output_token_count = usage["completion_tokens"]
             return self._build_service_result(
                 prompt=prompt,
                 generated_text=generated_text,

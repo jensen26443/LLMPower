@@ -7,7 +7,7 @@
 SUDO_PASSWORD="123456"
 POWER_LIMIT=350
 REPEATS=5
-BATCH_SIZES="1,4,8,16,32,50,64"
+BATCH_SIZES="1,2,4,6,8,12,16,24,32,40,48,50,56,60,64"
 OUTPUT_LENGTHS="10,20,40,50,75,100,150,200,300"
 OUTPUT_DIR="results_decode/decode_modeling"
 MODEL_PATH="./Qwen2.5-7B-Instruct-AWQ"
@@ -19,6 +19,11 @@ INTER_BATCH_SEC=0.8
 IDLE_BASELINE_SEC=2.0
 TIME_PADDING_MS=20.0
 GPU_MEMORY_UTILIZATION=0.85
+ENABLE_CHUNKED_PREFILL=true
+MAX_NUM_BATCHED_TOKENS=2048
+MAX_NUM_SEQS=64
+QUEUE_SEED=20260329
+SAMPLING_SEED=20260329
 
 # 运行模式
 # false: 复用外部已启动的 vLLM 服务（推荐）
@@ -42,6 +47,11 @@ echo "  模型路径: ${MODEL_PATH}"
 echo "  服务模型名: ${SERVED_MODEL_NAME}"
 echo "  服务地址: ${BASE_URL}"
 echo "  Prompt Token 数: ${PROMPT_TOKEN_COUNT}"
+echo "  Chunked Prefill: ${ENABLE_CHUNKED_PREFILL}"
+echo "  max_num_batched_tokens: ${MAX_NUM_BATCHED_TOKENS}"
+echo "  max_num_seqs: ${MAX_NUM_SEQS}"
+echo "  Queue Seed: ${QUEUE_SEED}"
+echo "  Sampling Seed: ${SAMPLING_SEED}"
 echo "  自动启动服务: ${START_SERVER}"
 echo "  跳过功率设置: ${SKIP_SET_POWER}"
 echo ""
@@ -70,6 +80,10 @@ CMD=(
     --idle-baseline-sec "${IDLE_BASELINE_SEC}"
     --time-padding-ms "${TIME_PADDING_MS}"
     --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}"
+    --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}"
+    --max-num-seqs "${MAX_NUM_SEQS}"
+    --queue-seed "${QUEUE_SEED}"
+    --sampling-seed "${SAMPLING_SEED}"
 )
 
 if [ -n "${SUDO_PASSWORD}" ]; then
@@ -82,6 +96,10 @@ fi
 
 if [ "${START_SERVER}" = true ]; then
     CMD+=(--start-server)
+fi
+
+if [ "${ENABLE_CHUNKED_PREFILL}" = true ]; then
+    CMD+=(--enable-chunked-prefill)
 fi
 
 echo "步骤1: 运行解码阶段建模实验..."

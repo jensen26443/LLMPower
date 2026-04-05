@@ -5,7 +5,7 @@ import subprocess
 import atexit
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Dict, Optional
+from typing import Callable, List, Dict, Optional
 
 # 尝试导入 vLLM 离线模式
 try:
@@ -417,7 +417,8 @@ class LLMInferencer:
         return results
 
     def infer_concurrent(self, prompts: List[str], max_tokens: int = 100, temperature: float = 0.7,
-                         extra_body: Optional[Dict] = None) -> List[Dict]:
+                         extra_body: Optional[Dict] = None,
+                         stream_hook: Optional[Callable[[Dict], None]] = None) -> List[Dict]:
         """
         服务模式下并发发起多个请求，用于触发 vLLM 在线 batching。
 
@@ -438,6 +439,8 @@ class LLMInferencer:
                 temperature=temperature,
                 client=client,
                 extra_body=extra_body,
+                request_index=index,
+                stream_hook=stream_hook,
             )
             result["request_index"] = index
             return index, result
@@ -457,7 +460,8 @@ class LLMInferencer:
         return [result for result in results if result is not None]
 
     def _infer_service(self, prompts: List[str], max_tokens: int = 100, temperature: float = 0.7,
-                       extra_body: Optional[Dict] = None) -> List[Dict]:
+                       extra_body: Optional[Dict] = None,
+                       stream_hook: Optional[Callable[[Dict], None]] = None) -> List[Dict]:
         """服务模式推理：流式 API 准确测量"""
         results = []
 
@@ -469,13 +473,17 @@ class LLMInferencer:
                     temperature=temperature,
                     client=self.client,
                     extra_body=extra_body,
+                    request_index=len(results),
+                    stream_hook=stream_hook,
                 )
             )
 
         return results
 
     def _infer_service_single(self, prompt: str, max_tokens: int = 100, temperature: float = 0.7,
-                              client=None, extra_body: Optional[Dict] = None) -> Dict:
+                              client=None, extra_body: Optional[Dict] = None,
+                              request_index: Optional[int] = None,
+                              stream_hook: Optional[Callable[[Dict], None]] = None) -> Dict:
         """服务模式下单请求推理，返回完整时间戳信息。"""
         client = client or self.client
         first_token_time = None
@@ -514,8 +522,19 @@ class LLMInferencer:
                     if first_token_time is None:
                         first_token_time = current_time
                         first_token_wall_time = current_wall_time
+                        event_type = "first_token"
+                    else:
+                        event_type = "chunk"
                     token_times.append(current_time)
                     generated_text += delta
+                    generated_tokens = output_token_count if output_token_count > 0 else self._count_generated_tokens(generated_text)
+                    if stream_hook is not None:
+                        stream_hook({
+                            "request_index": request_index,
+                            "event_type": event_type,
+                            "wall_time": current_wall_time,
+                            "generated_tokens": generated_tokens,
+                        })
 
         except Exception as e:
             print(f"警告: 推理失败: {e}")
@@ -543,6 +562,14 @@ class LLMInferencer:
                 usage = response.get("usage") or {}
                 if usage.get("completion_tokens") is not None:
                     output_token_count = usage["completion_tokens"]
+            if stream_hook is not None:
+                generated_tokens = output_token_count if output_token_count > 0 else self._count_generated_tokens(generated_text)
+                stream_hook({
+                    "request_index": request_index,
+                    "event_type": "finished",
+                    "wall_time": wall_end,
+                    "generated_tokens": generated_tokens,
+                })
             return self._build_service_result(
                 prompt=prompt,
                 generated_text=generated_text,
@@ -558,6 +585,14 @@ class LLMInferencer:
 
         full_end = time.perf_counter()
         wall_end = time.time()
+        if stream_hook is not None:
+            generated_tokens = output_token_count if output_token_count > 0 else self._count_generated_tokens(generated_text)
+            stream_hook({
+                "request_index": request_index,
+                "event_type": "finished",
+                "wall_time": wall_end,
+                "generated_tokens": generated_tokens,
+            })
         return self._build_service_result(
             prompt=prompt,
             generated_text=generated_text,

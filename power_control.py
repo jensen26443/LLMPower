@@ -1,6 +1,34 @@
-import subprocess
-import re
 import os
+import re
+import subprocess
+import threading
+import time
+
+
+class SudoKeepAlive:
+    """维持 sudo ticket，避免长实验中反复输入密码。"""
+
+    def __init__(self, interval_sec=60.0):
+        self.interval_sec = interval_sec
+        self._stop_event = threading.Event()
+        self._thread = None
+
+    def start(self, sudo_password=None):
+        if not prime_sudo_credentials(sudo_password=sudo_password):
+            return False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return True
+
+    def _run(self):
+        while not self._stop_event.wait(self.interval_sec):
+            refresh_sudo_credentials(non_interactive=True)
+
+    def stop(self):
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=2.0)
+            self._thread = None
 
 def is_wsl2():
     """检测是否为WSL2环境"""
@@ -60,6 +88,42 @@ def get_max_power_limit(device_index=0):
         print(f"获取最大功率限制失败: {e}")
         return None
 
+def _run_sudo_command(args, sudo_password=None, non_interactive=False):
+    cmd = ["sudo"]
+    if non_interactive:
+        cmd.append("-n")
+    elif sudo_password:
+        cmd.append("-S")
+    cmd.extend(args)
+    kwargs = {
+        "check": True,
+        "capture_output": True,
+        "text": True,
+    }
+    if sudo_password and not non_interactive:
+        kwargs["input"] = sudo_password + "\n"
+    return subprocess.run(cmd, **kwargs)
+
+
+def prime_sudo_credentials(sudo_password=None):
+    """在实验开始前建立 sudo ticket，只需交互一次。"""
+    try:
+        _run_sudo_command(["-v"], sudo_password=sudo_password)
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"初始化 sudo 凭证失败: {e.stderr}")
+        return False
+
+
+def refresh_sudo_credentials(non_interactive=True):
+    """刷新 sudo ticket，失败时返回 False，由调用方决定是否处理。"""
+    try:
+        _run_sudo_command(["-v"], non_interactive=non_interactive)
+        return True
+    except subprocess.CalledProcessError:
+        return False
+
+
 def set_power_cap(watts, device_index=0, sudo_password=None):
     """设置GPU功率限制，需要sudo权限，单位W
 
@@ -70,25 +134,10 @@ def set_power_cap(watts, device_index=0, sudo_password=None):
     """
     try:
         nvidia_smi = get_nvidia_smi_path()
-        if sudo_password:
-            # 提供了密码，使用 -S 选项从标准输入读取
-            cmd = ["sudo", "-S", nvidia_smi, "-i", str(device_index), "-pl", str(watts)]
-            result = subprocess.run(
-                cmd,
-                input=sudo_password + "\n",
-                text=True,
-                check=True,
-                capture_output=True
-            )
-        else:
-            # 没有密码，使用系统sudo
-            cmd = ["sudo", nvidia_smi, "-i", str(device_index), "-pl", str(watts)]
-            result = subprocess.run(
-                cmd,
-                check=True,
-                capture_output=True,
-                text=True
-            )
+        _run_sudo_command(
+            [nvidia_smi, "-i", str(device_index), "-pl", str(watts)],
+            sudo_password=sudo_password,
+        )
         return True
     except subprocess.CalledProcessError as e:
         print(f"设置功率限制失败: {e.stderr}")

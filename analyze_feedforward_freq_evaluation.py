@@ -1,0 +1,224 @@
+#!/usr/bin/env python3
+"""
+多旋钮前馈控制评估分析脚本。
+"""
+import argparse
+import glob
+import math
+import os
+from typing import Dict, Optional
+
+import matplotlib.pyplot as plt
+import pandas as pd
+import seaborn as sns
+
+sns.set_style("whitegrid")
+plt.rcParams["font.sans-serif"] = ["DejaVu Sans"]
+plt.rcParams["axes.unicode_minus"] = False
+
+PREFERRED_STRATEGY_ORDER = [
+    "ff_v2_recommended",
+    "ff_v3_freq_recommended",
+    "baseline_350w",
+]
+
+
+def load_latest_aggregated_csv(result_dir: str) -> Optional[pd.DataFrame]:
+    pattern = os.path.join(result_dir, "*_aggregated.csv")
+    files = glob.glob(pattern)
+    if not files:
+        return None
+    latest_file = max(files, key=os.path.getctime)
+    print(f"加载文件: {latest_file}")
+    return pd.read_csv(latest_file)
+
+
+def get_plot_strategy_order(df: pd.DataFrame):
+    present = set(df["strategy"].unique())
+    ordered = [name for name in PREFERRED_STRATEGY_ORDER if name in present]
+    remainder = sorted(name for name in present if name not in ordered)
+    return ordered + remainder
+
+
+def aggregate_across_full_repeats(df: pd.DataFrame) -> pd.DataFrame:
+    grouped = (
+        df.groupby(
+            ["strategy", "query_count", "output_length", "prefill_power_limit", "decode_scheme"],
+            as_index=False,
+        )
+        .agg(
+            avg_ttft_ms=("avg_ttft_ms", "mean"),
+            avg_tbt_ms=("avg_tbt_ms", "mean"),
+            avg_e2e_ms=("avg_e2e_ms", "mean"),
+            avg_energy_j=("avg_energy_j", "mean"),
+            avg_power_w=("avg_power_w", "mean"),
+        )
+        .sort_values(["strategy", "query_count", "output_length"])
+    )
+    grouped["query_length_label"] = grouped.apply(
+        lambda row: f"{int(row['query_count'])}/{int(row['output_length'])}",
+        axis=1,
+    )
+    return grouped
+
+
+def geometric_mean(values):
+    positive = [float(value) for value in values if float(value) > 0]
+    if not positive:
+        return 0.0
+    return math.exp(sum(math.log(value) for value in positive) / len(positive))
+
+
+def compute_relative_plot_df(df: pd.DataFrame) -> pd.DataFrame:
+    baseline_df = (
+        df[df["strategy"] == "baseline_350w"]
+        .set_index(["query_count", "output_length"])
+        .sort_index()
+    )
+    rows = []
+    for strategy in [name for name in get_plot_strategy_order(df) if name != "baseline_350w"]:
+        strategy_df = (
+            df[df["strategy"] == strategy]
+            .set_index(["query_count", "output_length"])
+            .sort_index()
+        )
+        shared_keys = sorted(set(strategy_df.index.tolist()) & set(baseline_df.index.tolist()))
+        ttft_ratios = []
+        tbt_ratios = []
+        e2e_ratios = []
+        energy_ratios = []
+        for query_count, output_length in shared_keys:
+            baseline_row = baseline_df.loc[(query_count, output_length)]
+            row = strategy_df.loc[(query_count, output_length)]
+            ttft_ratio = row["avg_ttft_ms"] / baseline_row["avg_ttft_ms"]
+            tbt_ratio = row["avg_tbt_ms"] / baseline_row["avg_tbt_ms"]
+            e2e_ratio = row["avg_e2e_ms"] / baseline_row["avg_e2e_ms"]
+            energy_ratio = row["avg_energy_j"] / baseline_row["avg_energy_j"]
+            ttft_ratios.append(ttft_ratio)
+            tbt_ratios.append(tbt_ratio)
+            e2e_ratios.append(e2e_ratio)
+            energy_ratios.append(energy_ratio)
+            label = f"{int(query_count)}/{int(output_length)}"
+            rows.extend([
+                {"strategy": strategy, "metric": "energy_saving_pct", "query_length_label": label, "query_count": query_count, "output_length": output_length, "value": (1.0 - energy_ratio) * 100.0},
+                {"strategy": strategy, "metric": "ttft_increase_pct", "query_length_label": label, "query_count": query_count, "output_length": output_length, "value": (ttft_ratio - 1.0) * 100.0},
+                {"strategy": strategy, "metric": "tbt_increase_pct", "query_length_label": label, "query_count": query_count, "output_length": output_length, "value": (tbt_ratio - 1.0) * 100.0},
+                {"strategy": strategy, "metric": "e2e_increase_pct", "query_length_label": label, "query_count": query_count, "output_length": output_length, "value": (e2e_ratio - 1.0) * 100.0},
+            ])
+        rows.extend([
+            {"strategy": strategy, "metric": "energy_saving_pct", "query_length_label": "GEOMEAN", "query_count": None, "output_length": None, "value": (1.0 - geometric_mean(energy_ratios)) * 100.0},
+            {"strategy": strategy, "metric": "ttft_increase_pct", "query_length_label": "GEOMEAN", "query_count": None, "output_length": None, "value": (geometric_mean(ttft_ratios) - 1.0) * 100.0},
+            {"strategy": strategy, "metric": "tbt_increase_pct", "query_length_label": "GEOMEAN", "query_count": None, "output_length": None, "value": (geometric_mean(tbt_ratios) - 1.0) * 100.0},
+            {"strategy": strategy, "metric": "e2e_increase_pct", "query_length_label": "GEOMEAN", "query_count": None, "output_length": None, "value": (geometric_mean(e2e_ratios) - 1.0) * 100.0},
+        ])
+    return pd.DataFrame(rows)
+
+
+def plot_metric(df: pd.DataFrame, metric_col: str, title: str, ylabel: str, output_path: str):
+    ordered_labels = df.sort_values(["query_count", "output_length"])["query_length_label"].drop_duplicates().tolist()
+    plot_df = df.copy()
+    plot_df["query_length_label"] = pd.Categorical(plot_df["query_length_label"], categories=ordered_labels, ordered=True)
+    plt.figure(figsize=(12, 7))
+    sns.barplot(data=plot_df.sort_values("query_length_label"), x="query_length_label", y=metric_col, hue="strategy", hue_order=get_plot_strategy_order(df))
+    plt.title(title)
+    plt.xlabel("Number of Query / Length of Generation")
+    plt.ylabel(ylabel)
+    plt.xticks(rotation=25)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+
+def plot_relative_metric(df: pd.DataFrame, metric: str, title: str, ylabel: str, output_path: str):
+    metric_df = df[df["metric"] == metric].copy()
+    ordered_labels = metric_df[metric_df["query_length_label"] != "GEOMEAN"].sort_values(["query_count", "output_length"])["query_length_label"].drop_duplicates().tolist()
+    ordered_labels.append("GEOMEAN")
+    metric_df["query_length_label"] = pd.Categorical(metric_df["query_length_label"], categories=ordered_labels, ordered=True)
+    plt.figure(figsize=(13, 7))
+    sns.barplot(data=metric_df.sort_values("query_length_label"), x="query_length_label", y="value", hue="strategy", hue_order=get_plot_strategy_order(metric_df))
+    plt.axhline(0.0, color="black", linewidth=1.0)
+    plt.title(title)
+    plt.xlabel("Number of Query / Length of Generation")
+    plt.ylabel(ylabel)
+    plt.xticks(rotation=25)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+
+def write_report(df: pd.DataFrame, output_path: str):
+    baseline_df = df[df["strategy"] == "baseline_350w"].set_index(["query_count", "output_length"])
+    lines = [
+        "# Feedforward Frequency Evaluation Report",
+        "",
+        f"- Strategy count: {df['strategy'].nunique()}",
+        f"- Query counts: {sorted(df['query_count'].unique().tolist())}",
+        f"- Output lengths: {sorted(df['output_length'].unique().tolist())}",
+        "",
+        "## Relative To Baseline 350W",
+    ]
+    for strategy in get_plot_strategy_order(df):
+        if strategy == "baseline_350w":
+            continue
+        strategy_df = df[df["strategy"] == strategy].set_index(["query_count", "output_length"])
+        shared_keys = sorted(set(strategy_df.index.tolist()) & set(baseline_df.index.tolist()))
+        energy_saving = []
+        tbt_increase = []
+        for key in shared_keys:
+            baseline_row = baseline_df.loc[key]
+            row = strategy_df.loc[key]
+            energy_saving.append((1.0 - row["avg_energy_j"] / baseline_row["avg_energy_j"]) * 100.0)
+            tbt_increase.append((row["avg_tbt_ms"] / baseline_row["avg_tbt_ms"] - 1.0) * 100.0)
+        lines.append(
+            f"- {strategy}: mean energy saving={sum(energy_saving)/len(energy_saving):.2f}%, "
+            f"mean TBT increase={sum(tbt_increase)/len(tbt_increase):.2f}%"
+        )
+    with open(output_path, "w", encoding="utf-8") as file_obj:
+        file_obj.write("\n".join(lines))
+
+
+def generate_outputs(agg_df: pd.DataFrame, output_dir: str) -> Dict[str, str]:
+    os.makedirs(output_dir, exist_ok=True)
+    plot_df = aggregate_across_full_repeats(agg_df)
+    relative_df = compute_relative_plot_df(plot_df)
+    outputs = {
+        "ttft": os.path.join(output_dir, "feedforward_freq_ttft.png"),
+        "tbt": os.path.join(output_dir, "feedforward_freq_tbt.png"),
+        "e2e": os.path.join(output_dir, "feedforward_freq_e2e.png"),
+        "energy": os.path.join(output_dir, "feedforward_freq_energy.png"),
+        "power": os.path.join(output_dir, "feedforward_freq_power.png"),
+        "energy_saving": os.path.join(output_dir, "feedforward_freq_energy_saving.png"),
+        "ttft_increase": os.path.join(output_dir, "feedforward_freq_ttft_increase.png"),
+        "tbt_increase": os.path.join(output_dir, "feedforward_freq_tbt_increase.png"),
+        "e2e_increase": os.path.join(output_dir, "feedforward_freq_e2e_increase.png"),
+        "report": os.path.join(output_dir, "feedforward_freq_report.md"),
+    }
+    plot_metric(plot_df, "avg_ttft_ms", "TTFT by Query Count / Output Length", "TTFT (ms)", outputs["ttft"])
+    plot_metric(plot_df, "avg_tbt_ms", "TBT by Query Count / Output Length", "TBT (ms)", outputs["tbt"])
+    plot_metric(plot_df, "avg_e2e_ms", "E2E by Query Count / Output Length", "E2E (ms)", outputs["e2e"])
+    plot_metric(plot_df, "avg_energy_j", "Energy by Query Count / Output Length", "Energy (J)", outputs["energy"])
+    plot_metric(plot_df, "avg_power_w", "Power by Query Count / Output Length", "Power (W)", outputs["power"])
+    plot_relative_metric(relative_df, "energy_saving_pct", "Energy Saving Relative to Baseline", "Energy Saving (%)", outputs["energy_saving"])
+    plot_relative_metric(relative_df, "ttft_increase_pct", "TTFT Increase Relative to Baseline", "TTFT Increase (%)", outputs["ttft_increase"])
+    plot_relative_metric(relative_df, "tbt_increase_pct", "TBT Increase Relative to Baseline", "TBT Increase (%)", outputs["tbt_increase"])
+    plot_relative_metric(relative_df, "e2e_increase_pct", "E2E Increase Relative to Baseline", "E2E Increase (%)", outputs["e2e_increase"])
+    write_report(plot_df, outputs["report"])
+    return outputs
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Analyze feedforward frequency evaluation results.")
+    parser.add_argument("--result-dir", required=True)
+    parser.add_argument("--output-dir", required=True)
+    args = parser.parse_args()
+    agg_df = load_latest_aggregated_csv(args.result_dir)
+    if agg_df is None or agg_df.empty:
+        raise RuntimeError("No aggregated data found")
+    outputs = generate_outputs(agg_df, args.output_dir)
+    print("生成文件:")
+    for key, value in outputs.items():
+        print(f"- {key}: {value}")
+
+
+if __name__ == "__main__":
+    main()

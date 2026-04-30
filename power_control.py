@@ -3,6 +3,7 @@ import re
 import subprocess
 import threading
 import time
+from typing import Dict, List, Optional
 
 
 class SudoKeepAlive:
@@ -88,6 +89,132 @@ def get_max_power_limit(device_index=0):
         print(f"获取最大功率限制失败: {e}")
         return None
 
+
+def parse_supported_clock_pairs(raw_output: str) -> List[Dict[str, int]]:
+    """解析 `nvidia-smi --query-supported-clocks=memory,graphics` 输出。"""
+    pairs: List[Dict[str, int]] = []
+    for raw_line in raw_output.splitlines():
+        line = raw_line.strip()
+        if not line or line.lower().startswith("memory"):
+            continue
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) != 2:
+            continue
+        try:
+            memory_mhz = int(float(parts[0]))
+            graphics_mhz = int(float(parts[1]))
+        except ValueError:
+            continue
+        pairs.append({
+            "memory_mhz": memory_mhz,
+            "graphics_mhz": graphics_mhz,
+        })
+    return pairs
+
+
+def sample_clock_profile_pairs(pairs: List[Dict[str, int]],
+                               count: int = 6,
+                               min_sm_mhz: int = 1000,
+                               min_mem_mhz: int = 5000) -> List[Dict[str, int]]:
+    """按最低 `SM/MEM` 频率阈值过滤后，再按分位点抽样受支持的组合。"""
+    if not pairs:
+        return []
+    ordered = sorted(
+        {
+            (int(item["memory_mhz"]), int(item["graphics_mhz"]))
+            for item in pairs
+            if int(item["graphics_mhz"]) >= int(min_sm_mhz)
+            and int(item["memory_mhz"]) >= int(min_mem_mhz)
+        }
+    )
+    if not ordered:
+        return []
+    if count >= len(ordered):
+        return [
+            {"memory_mhz": memory_mhz, "graphics_mhz": graphics_mhz}
+            for memory_mhz, graphics_mhz in ordered
+        ]
+
+    selected_indices = set()
+    max_index = len(ordered) - 1
+    for bucket_index in range(count):
+        ratio = bucket_index / max(1, count - 1)
+        selected_indices.add(int(round(ratio * max_index)))
+    sampled = [ordered[index] for index in sorted(selected_indices)]
+    return [
+        {"memory_mhz": memory_mhz, "graphics_mhz": graphics_mhz}
+        for memory_mhz, graphics_mhz in sampled
+    ]
+
+
+def query_supported_clock_pairs(device_index=0) -> List[Dict[str, int]]:
+    """查询 GPU 支持的 `(memory, graphics)` 频率组合。"""
+    try:
+        nvidia_smi = get_nvidia_smi_path()
+        result = subprocess.run(
+            [
+                nvidia_smi,
+                "-i",
+                str(device_index),
+                "--query-supported-clocks=memory,graphics",
+                "--format=csv,noheader,nounits",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return parse_supported_clock_pairs(result.stdout)
+    except Exception as e:
+        print(f"查询支持频率失败: {e}")
+        return []
+
+
+def probe_clock_capabilities(device_index=0,
+                             sample_count: int = 6,
+                             min_sm_mhz: int = 1000,
+                             min_mem_mhz: int = 5000) -> Dict:
+    """探测 GPU 锁频能力和抽样频率档位。"""
+    support_pairs = query_supported_clock_pairs(device_index=device_index)
+    sampled_pairs = sample_clock_profile_pairs(
+        support_pairs,
+        count=sample_count,
+        min_sm_mhz=min_sm_mhz,
+        min_mem_mhz=min_mem_mhz,
+    )
+    return {
+        "device_index": int(device_index),
+        "supports_gpu_clock_lock": bool(support_pairs),
+        "supports_memory_clock_lock": bool(support_pairs),
+        "supported_clock_pairs": support_pairs,
+        "sampled_clock_pairs": sampled_pairs,
+        "min_sm_mhz_filter": int(min_sm_mhz),
+        "min_mem_mhz_filter": int(min_mem_mhz),
+        "sample_count": int(sample_count),
+    }
+
+
+def build_hardware_profile_commands(power_w: Optional[int] = None,
+                                    sm_mhz: Optional[int] = None,
+                                    mem_mhz: Optional[int] = None,
+                                    device_index: int = 0) -> List[List[str]]:
+    nvidia_smi = get_nvidia_smi_path()
+    commands: List[List[str]] = []
+    if sm_mhz is not None:
+        commands.append([nvidia_smi, "-i", str(device_index), "-lgc", f"{int(sm_mhz)},{int(sm_mhz)}"])
+    if mem_mhz is not None:
+        commands.append([nvidia_smi, "-i", str(device_index), "-lmc", f"{int(mem_mhz)},{int(mem_mhz)}"])
+    if power_w is not None:
+        commands.append([nvidia_smi, "-i", str(device_index), "-pl", str(int(power_w))])
+    return commands
+
+
+def build_reset_clock_commands(device_index: int = 0) -> List[List[str]]:
+    nvidia_smi = get_nvidia_smi_path()
+    return [
+        [nvidia_smi, "-i", str(device_index), "-rgc"],
+        [nvidia_smi, "-i", str(device_index), "-rmc"],
+    ]
+
 def _run_sudo_command(args, sudo_password=None, non_interactive=False):
     cmd = ["sudo"]
     if non_interactive:
@@ -142,6 +269,67 @@ def set_power_cap(watts, device_index=0, sudo_password=None):
     except subprocess.CalledProcessError as e:
         print(f"设置功率限制失败: {e.stderr}")
         return False
+
+
+def set_gpu_clocks(sm_mhz: Optional[int] = None,
+                   mem_mhz: Optional[int] = None,
+                   device_index: int = 0,
+                   sudo_password: Optional[str] = None) -> bool:
+    """设置 GPU SM / 显存频率。"""
+    commands = build_hardware_profile_commands(
+        power_w=None,
+        sm_mhz=sm_mhz,
+        mem_mhz=mem_mhz,
+        device_index=device_index,
+    )
+    try:
+        for command in commands:
+            _run_sudo_command(command, sudo_password=sudo_password)
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"设置 GPU 频率失败: {e.stderr}")
+        return False
+
+
+def reset_gpu_clocks(device_index: int = 0, sudo_password: Optional[str] = None) -> bool:
+    """恢复 GPU SM / 显存频率。"""
+    try:
+        for command in build_reset_clock_commands(device_index=device_index):
+            _run_sudo_command(command, sudo_password=sudo_password)
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"恢复 GPU 频率失败: {e.stderr}")
+        return False
+
+
+def apply_hardware_profile(power_w: Optional[int] = None,
+                           sm_mhz: Optional[int] = None,
+                           mem_mhz: Optional[int] = None,
+                           device_index: int = 0,
+                           sudo_password: Optional[str] = None) -> bool:
+    """统一设置频率和功率上限。先锁频，再设功率。"""
+    try:
+        for command in build_hardware_profile_commands(
+            power_w=power_w,
+            sm_mhz=sm_mhz,
+            mem_mhz=mem_mhz,
+            device_index=device_index,
+        ):
+            _run_sudo_command(command, sudo_password=sudo_password)
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"应用硬件 profile 失败: {e.stderr}")
+        return False
+
+
+def reset_hardware_profile(default_power_w: Optional[int] = None,
+                           device_index: int = 0,
+                           sudo_password: Optional[str] = None) -> bool:
+    """恢复默认频率和功率上限。"""
+    ok = reset_gpu_clocks(device_index=device_index, sudo_password=sudo_password)
+    if default_power_w is not None:
+        ok = set_power_cap(default_power_w, device_index=device_index, sudo_password=sudo_password) and ok
+    return ok
 
 def get_current_power(device_index=0):
     """获取当前GPU实时功率，单位W，使用nvidia-smi命令行"""

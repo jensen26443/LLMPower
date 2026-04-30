@@ -53,7 +53,21 @@ class PowerMonitor:
                     self._nvml_handle,
                     pynvml.NVML_TEMPERATURE_GPU,
                 )
-                return power_mw / 1000.0, memory.used / (1024 ** 3), int(temperature)
+                graphics_clock = pynvml.nvmlDeviceGetClockInfo(
+                    self._nvml_handle,
+                    pynvml.NVML_CLOCK_GRAPHICS,
+                )
+                memory_clock = pynvml.nvmlDeviceGetClockInfo(
+                    self._nvml_handle,
+                    pynvml.NVML_CLOCK_MEM,
+                )
+                return (
+                    power_mw / 1000.0,
+                    memory.used / (1024 ** 3),
+                    int(temperature),
+                    float(graphics_clock),
+                    float(memory_clock),
+                )
             except Exception as e:
                 print(f"pynvml 读取失败，回退 nvidia-smi: {e}")
                 self._backend = "nvidia-smi"
@@ -61,7 +75,7 @@ class PowerMonitor:
         try:
             result = subprocess.run(
                 ["nvidia-smi", "-i", str(self.device_index),
-                 "--query-gpu=power.draw,memory.used,temperature.gpu",
+                 "--query-gpu=power.draw,memory.used,temperature.gpu,clocks.current.graphics,clocks.current.memory",
                  "--format=csv,noheader,nounits"],
                 check=True, capture_output=True, text=True
             )
@@ -69,14 +83,16 @@ class PowerMonitor:
             power = float(parts[0])
             memory_used = float(parts[1]) / 1024  # 转换为GB
             temperature = int(parts[2])
-            return power, memory_used, temperature
+            graphics_clock = float(parts[3])
+            memory_clock = float(parts[4])
+            return power, memory_used, temperature, graphics_clock, memory_clock
         except Exception as e:
             print(f"获取GPU状态失败: {e}")
-            return 0.0, 0.0, 0
+            return 0.0, 0.0, 0, 0.0, 0.0
 
     def _monitor_loop(self):
         while self.running:
-            power, memory_used, temperature = self._get_gpu_stats()
+            power, memory_used, temperature, graphics_clock, memory_clock = self._get_gpu_stats()
             # 在采样数据获取后打时间戳，减少命令调用耗时带来的时间偏移
             timestamp = time.time()
 
@@ -84,7 +100,9 @@ class PowerMonitor:
                 "timestamp": timestamp,
                 "power_w": power,
                 "memory_gb": memory_used,
-                "temperature_c": temperature
+                "temperature_c": temperature,
+                "graphics_clock_mhz": graphics_clock,
+                "memory_clock_mhz": memory_clock,
             })
             time.sleep(self.sample_interval)
 
@@ -120,7 +138,17 @@ class PowerMonitor:
     def save_to_csv(self, filename: str):
         """保存监测数据到CSV"""
         with open(filename, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=["timestamp", "power_w", "memory_gb", "temperature_c"])
+            writer = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "timestamp",
+                    "power_w",
+                    "memory_gb",
+                    "temperature_c",
+                    "graphics_clock_mhz",
+                    "memory_clock_mhz",
+                ],
+            )
             writer.writeheader()
             writer.writerows(self.power_data)
 

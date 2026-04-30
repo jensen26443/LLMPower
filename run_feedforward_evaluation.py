@@ -77,6 +77,27 @@ STRATEGIES = [
         "decode_buckets": [(1.0, 170), (2.0, 200), (float("inf"), 215)],
         "decode_scheme": "170/200/215",
     },
+    {
+        "name": "ff_decode_energy_saving",
+        "type": "feedforward",
+        "prefill_buckets": V2_PREFILL_BUCKETS,
+        "decode_recommendation_profile": "decode_energy_saving",
+        "decode_scheme": "recommendation:decode_energy_saving",
+    },
+    {
+        "name": "ff_decode_balanced",
+        "type": "feedforward",
+        "prefill_buckets": V2_PREFILL_BUCKETS,
+        "decode_recommendation_profile": "decode_balanced",
+        "decode_scheme": "recommendation:decode_balanced",
+    },
+    {
+        "name": "ff_decode_tbt_guarded",
+        "type": "feedforward",
+        "prefill_buckets": V2_PREFILL_BUCKETS,
+        "decode_recommendation_profile": "decode_tbt_guarded",
+        "decode_scheme": "recommendation:decode_tbt_guarded",
+    },
 ]
 
 RAW_FIELDNAMES = [
@@ -106,6 +127,8 @@ RAW_FIELDNAMES = [
     "avg_power_w",
     "total_energy_j",
     "peak_power_w",
+    "avg_sm_clock_mhz",
+    "avg_mem_clock_mhz",
     "num_requests",
     "actual_output_tokens",
 ]
@@ -125,6 +148,8 @@ AGG_FIELDNAMES = [
     "avg_e2e_ms",
     "avg_energy_j",
     "avg_power_w",
+    "avg_sm_clock_mhz",
+    "avg_mem_clock_mhz",
 ]
 
 
@@ -142,6 +167,58 @@ def get_decode_power_for_kvb(strategy: Dict, kvb: float) -> int:
         if kvb <= threshold:
             return int(power)
     return int(strategy["decode_buckets"][-1][1])
+
+
+def load_decode_bucket_recommendations(file_path: str) -> Dict:
+    with open(file_path, "r", encoding="utf-8") as file_obj:
+        payload = json.load(file_obj)
+    if "profiles" not in payload:
+        raise ValueError("Decode recommendation JSON must contain a 'profiles' object")
+    return payload
+
+
+def get_recommended_decode_power(decode_recommendations: Dict,
+                                 profile_name: str,
+                                 query_count: int,
+                                 output_length: int) -> int:
+    profiles = decode_recommendations.get("profiles", {})
+    profile = profiles.get(profile_name)
+    if profile is None:
+        raise ValueError(f"Decode recommendation profile not found: {profile_name}")
+    for load in profile.get("loads", []):
+        if int(load["query_count"]) == int(query_count) and int(load["output_length"]) == int(output_length):
+            return int(load["decode_power_cap_w"])
+    raise ValueError(
+        f"Decode recommendation missing load: profile={profile_name}, "
+        f"query_count={query_count}, output_length={output_length}"
+    )
+
+
+def prepare_strategy_for_block(strategy: Dict,
+                               query_count: int,
+                               output_length: int,
+                               decode_recommendations: Optional[Dict] = None) -> Dict:
+    profile_name = strategy.get("decode_recommendation_profile")
+    if not profile_name:
+        return strategy
+    if decode_recommendations is None:
+        raise ValueError(
+            f"Strategy {strategy['name']} requires --decode-recommendation-json"
+        )
+    decode_power = get_recommended_decode_power(
+        decode_recommendations,
+        profile_name=profile_name,
+        query_count=query_count,
+        output_length=output_length,
+    )
+    prepared = dict(strategy)
+    prepared["decode_buckets"] = [(float("inf"), int(decode_power))]
+    prepared["decode_scheme"] = f"fixed_decode_{int(decode_power)}"
+    return prepared
+
+
+def strategy_requires_decode_recommendations(strategy: Dict) -> bool:
+    return bool(strategy.get("decode_recommendation_profile"))
 
 
 def compute_kvb(prompt_token_counts: Sequence[int],
@@ -325,6 +402,8 @@ def aggregate_raw_rows(raw_rows: List[Dict]) -> List[Dict]:
             "avg_e2e_ms": statistics.mean(float(item["avg_e2e_ms"]) for item in rows),
             "avg_energy_j": statistics.mean(float(item["total_energy_j"]) for item in rows),
             "avg_power_w": statistics.mean(float(item["avg_power_w"]) for item in rows),
+            "avg_sm_clock_mhz": statistics.mean(float(item["avg_sm_clock_mhz"]) for item in rows),
+            "avg_mem_clock_mhz": statistics.mean(float(item["avg_mem_clock_mhz"]) for item in rows),
         })
     return aggregated
 
@@ -393,11 +472,23 @@ def rotate_items(items: Sequence, offset: int) -> List:
 
 def build_power_window_stats(start_time: float, end_time: float, power_data: List[Dict]) -> Dict[str, float]:
     if not power_data:
-        return {"avg_power_w": 0.0, "total_energy_j": 0.0, "peak_power_w": 0.0}
+        return {
+            "avg_power_w": 0.0,
+            "total_energy_j": 0.0,
+            "peak_power_w": 0.0,
+            "avg_sm_clock_mhz": 0.0,
+            "avg_mem_clock_mhz": 0.0,
+        }
 
     samples = [point for point in power_data if start_time <= point["timestamp"] <= end_time]
     if not samples:
-        return {"avg_power_w": 0.0, "total_energy_j": 0.0, "peak_power_w": 0.0}
+        return {
+            "avg_power_w": 0.0,
+            "total_energy_j": 0.0,
+            "peak_power_w": 0.0,
+            "avg_sm_clock_mhz": 0.0,
+            "avg_mem_clock_mhz": 0.0,
+        }
 
     duration = max(0.0, end_time - start_time)
     avg_power = statistics.mean(point["power_w"] for point in samples)
@@ -405,6 +496,8 @@ def build_power_window_stats(start_time: float, end_time: float, power_data: Lis
         "avg_power_w": avg_power,
         "total_energy_j": avg_power * duration,
         "peak_power_w": max(point["power_w"] for point in samples),
+        "avg_sm_clock_mhz": statistics.mean(float(point.get("graphics_clock_mhz", 0.0)) for point in samples),
+        "avg_mem_clock_mhz": statistics.mean(float(point.get("memory_clock_mhz", 0.0)) for point in samples),
     }
 
 
@@ -510,7 +603,8 @@ def run_feedforward_evaluation(output_dir: str,
                                sudo_password: Optional[str],
                                skip_set_power: bool,
                                strategy_names: Optional[Sequence[str]] = None,
-                               only_strategy: Optional[str] = None):
+                               only_strategy: Optional[str] = None,
+                               decode_recommendation_json: Optional[str] = None):
     os.makedirs(output_dir, exist_ok=True)
     experiment_id = f"feedforward_eval_{int(time.time())}"
     raw_path = os.path.join(output_dir, f"{experiment_id}_raw.csv")
@@ -532,6 +626,12 @@ def run_feedforward_evaluation(output_dir: str,
         strategies = [item for item in STRATEGIES if item["name"] == only_strategy]
         if not strategies:
             raise ValueError(f"Unknown strategy: {only_strategy}")
+
+    decode_recommendations = None
+    if any(strategy_requires_decode_recommendations(item) for item in strategies):
+        if not decode_recommendation_json:
+            raise ValueError("Selected decode recommendation strategies require --decode-recommendation-json")
+        decode_recommendations = load_decode_bucket_recommendations(decode_recommendation_json)
 
     inferencer = LLMInferencer(
         model_name=model_path,
@@ -559,6 +659,7 @@ def run_feedforward_evaluation(output_dir: str,
         "tokenizer_path": tokenizer_path,
         "sharegpt_dir": sharegpt_dir,
         "skip_set_power": skip_set_power,
+        "decode_recommendation_json": decode_recommendation_json,
         "started_at": time.time(),
     }
     write_json_file(metadata_path, metadata)
@@ -657,10 +758,16 @@ def run_feedforward_evaluation(output_dir: str,
                             tqdm(measurement_slice, desc=f"{strategy['name']} q={query_count} l={output_length}", leave=False),
                             start=1,
                         ):
+                            block_strategy = prepare_strategy_for_block(
+                                strategy,
+                                query_count=query_count,
+                                output_length=int(output_length),
+                                decode_recommendations=decode_recommendations,
+                            )
                             prompt_token_counts = [int(item["prompt_tokens"]) for item in batch_prompts]
                             total_input_tokens = sum(prompt_token_counts)
                             controller = FeedforwardController(
-                                strategy=strategy,
+                                strategy=block_strategy,
                                 prompt_token_counts=prompt_token_counts,
                                 total_input_tokens=total_input_tokens,
                                 routing_input_tokens=int(query_group["target_input_tokens"]),
@@ -670,7 +777,7 @@ def run_feedforward_evaluation(output_dir: str,
 
                             for warmup_monitor_batch in monitor_warmup_slice if batch_repeat == 1 else []:
                                 warmup_controller = FeedforwardController(
-                                    strategy=strategy,
+                                    strategy=block_strategy,
                                     prompt_token_counts=[int(item["prompt_tokens"]) for item in warmup_monitor_batch],
                                     total_input_tokens=sum(int(item["prompt_tokens"]) for item in warmup_monitor_batch),
                                     routing_input_tokens=int(query_group["target_input_tokens"]),
@@ -710,7 +817,7 @@ def run_feedforward_evaluation(output_dir: str,
                                 "output_length": int(output_length),
                                 "batch_repeat": batch_repeat,
                                 "prefill_power_limit": prefill_power_limit,
-                                "decode_scheme": strategy["decode_scheme"],
+                                "decode_scheme": block_strategy["decode_scheme"],
                                 "power_change_count": controller.power_change_count,
                                 "power_event_trace_json": json.dumps(controller.power_event_trace, ensure_ascii=False),
                                 **metric_stats,
@@ -788,6 +895,7 @@ def parse_args():
     parser.add_argument("--skip-set-power", action="store_true")
     parser.add_argument("--strategy-names", default=None)
     parser.add_argument("--only-strategy", default=None)
+    parser.add_argument("--decode-recommendation-json", default=None)
     return parser.parse_args()
 
 
@@ -813,6 +921,7 @@ def main():
         skip_set_power=args.skip_set_power,
         strategy_names=[item.strip() for item in args.strategy_names.split(",")] if args.strategy_names else None,
         only_strategy=args.only_strategy,
+        decode_recommendation_json=args.decode_recommendation_json,
     )
 
 

@@ -5,7 +5,7 @@ import time
 from typing import Dict
 
 class DynamicPowerInferencer:
-    def __init__(self, model_name: str = "Qwen/Qwen2-7B-Instruct-GPTQ-Int4",
+    def __init__(self, model_name: str = "./Qwen2.5-7B-Instruct-AWQ",
                  full_power: int = 140, decode_power: int = 70):
         self.full_power = full_power  # Prefill阶段最大功率
         self.decode_power = decode_power  # Decode阶段功率

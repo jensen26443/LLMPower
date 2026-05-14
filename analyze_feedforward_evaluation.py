@@ -20,6 +20,8 @@ PREFERRED_STRATEGY_ORDER = [
     "ff_idea5",
     "ff_optimized",
     "ff_v2_recommended",
+    "ff_decode_tbt_guarded",
+    "ff_decode_tbt_guarded_pid",
     "baseline_350w",
 ]
 
@@ -55,18 +57,29 @@ def get_plot_strategy_order(df: pd.DataFrame):
 
 
 def aggregate_across_full_repeats(df: pd.DataFrame) -> pd.DataFrame:
+    agg_map = {
+        "avg_ttft_ms": ("avg_ttft_ms", "mean"),
+        "avg_tbt_ms": ("avg_tbt_ms", "mean"),
+        "avg_e2e_ms": ("avg_e2e_ms", "mean"),
+        "avg_energy_j": ("avg_energy_j", "mean"),
+        "avg_power_w": ("avg_power_w", "mean"),
+    }
+    for column in [
+        "avg_power_change_count",
+        "avg_pid_update_count",
+        "avg_pid_prefill_delta_w",
+        "avg_pid_decode_delta_w",
+        "avg_pid_decode_feedback_tbt_ms",
+    ]:
+        if column in df.columns:
+            agg_map[column] = (column, "mean")
+
     grouped = (
         df.groupby(
             ["strategy", "query_count", "output_length", "prefill_power_limit", "decode_scheme"],
             as_index=False,
         )
-        .agg(
-            avg_ttft_ms=("avg_ttft_ms", "mean"),
-            avg_tbt_ms=("avg_tbt_ms", "mean"),
-            avg_e2e_ms=("avg_e2e_ms", "mean"),
-            avg_energy_j=("avg_energy_j", "mean"),
-            avg_power_w=("avg_power_w", "mean"),
-        )
+        .agg(**agg_map)
         .sort_values(["strategy", "query_count", "output_length"])
     )
     grouped["query_length_label"] = grouped.apply(
@@ -274,23 +287,23 @@ def plot_relative_metric(df: pd.DataFrame, metric: str, title: str, ylabel: str,
 
 
 def write_report(df: pd.DataFrame, output_path: str):
-    df = aggregate_for_relative(df)
-    baseline_df = df[df["strategy"] == "baseline_350w"].set_index(["query_count", "output_length"])
+    relative_source_df = aggregate_for_relative(df)
+    baseline_df = relative_source_df[relative_source_df["strategy"] == "baseline_350w"].set_index(["query_count", "output_length"])
     lines = [
         "# Feedforward Evaluation Report",
         "",
         "## Summary",
-        f"- Strategy count: {df['strategy'].nunique()}",
-        f"- Query counts: {sorted(df['query_count'].unique().tolist())}",
-        f"- Output lengths: {sorted(df['output_length'].unique().tolist())}",
+        f"- Strategy count: {relative_source_df['strategy'].nunique()}",
+        f"- Query counts: {sorted(relative_source_df['query_count'].unique().tolist())}",
+        f"- Output lengths: {sorted(relative_source_df['output_length'].unique().tolist())}",
         "",
         "## Relative To Baseline 350W",
     ]
 
-    for strategy in get_plot_strategy_order(df):
+    for strategy in get_plot_strategy_order(relative_source_df):
         if strategy == "baseline_350w":
             continue
-        strategy_df = df[df["strategy"] == strategy].set_index(["query_count", "output_length"])
+        strategy_df = relative_source_df[relative_source_df["strategy"] == strategy].set_index(["query_count", "output_length"])
         shared_keys = sorted(set(strategy_df.index.tolist()) & set(baseline_df.index.tolist()))
         if not shared_keys:
             continue
@@ -307,6 +320,21 @@ def write_report(df: pd.DataFrame, output_path: str):
             f"- {strategy}: mean energy saving={sum(energy_saving)/len(energy_saving):.2f}%, "
             f"mean TBT increase={sum(tbt_increase)/len(tbt_increase):.2f}%"
         )
+
+    if "avg_pid_update_count" in df.columns:
+        pid_df = df[df["strategy"].astype(str).str.contains("pid", case=False, na=False)]
+        if not pid_df.empty:
+            lines.extend(["", "## PID Guard Behavior"])
+            for strategy in get_plot_strategy_order(pid_df):
+                strategy_df = pid_df[pid_df["strategy"] == strategy]
+                if strategy_df.empty:
+                    continue
+                lines.append(
+                    f"- {strategy}: mean PID updates={strategy_df['avg_pid_update_count'].mean():.2f}, "
+                    f"mean prefill delta={strategy_df.get('avg_pid_prefill_delta_w', pd.Series([0.0])).mean():.2f} W, "
+                    f"mean decode delta={strategy_df.get('avg_pid_decode_delta_w', pd.Series([0.0])).mean():.2f} W, "
+                    f"mean feedback TBT={strategy_df.get('avg_pid_decode_feedback_tbt_ms', pd.Series([0.0])).mean():.2f} ms"
+                )
 
     with open(output_path, "w", encoding="utf-8") as file_obj:
         file_obj.write("\n".join(lines))
@@ -339,6 +367,26 @@ def generate_outputs(agg_df: pd.DataFrame, output_dir: str) -> Dict[str, str]:
     plot_relative_metric(relative_df, "ttft_increase_pct", "TTFT Increase Relative to Baseline", "TTFT Increase (%)", outputs["ttft_increase"])
     plot_relative_metric(relative_df, "tbt_increase_pct", "TBT Increase Relative to Baseline", "TBT Increase (%)", outputs["tbt_increase"])
     plot_relative_metric(relative_df, "e2e_increase_pct", "E2E Increase Relative to Baseline", "E2E Increase (%)", outputs["e2e_increase"])
+    if "avg_pid_update_count" in plot_df.columns:
+        outputs["pid_delta"] = os.path.join(output_dir, "feedforward_pid_delta.png")
+        outputs["pid_updates"] = os.path.join(output_dir, "feedforward_pid_updates.png")
+        outputs["pid_feedback_tbt"] = os.path.join(output_dir, "feedforward_pid_feedback_tbt.png")
+        pid_df = plot_df[plot_df["strategy"].astype(str).str.contains("pid", case=False, na=False)].copy()
+        if not pid_df.empty:
+            pid_df["avg_pid_total_delta_w"] = (
+                pid_df.get("avg_pid_prefill_delta_w", 0.0)
+                + pid_df.get("avg_pid_decode_delta_w", 0.0)
+            )
+            plot_metric(pid_df, "avg_pid_total_delta_w", "Mean PID Power Delta", "PID Delta (W)", outputs["pid_delta"])
+            plot_metric(pid_df, "avg_pid_update_count", "Mean PID Update Count", "PID Updates", outputs["pid_updates"])
+            if "avg_pid_decode_feedback_tbt_ms" in pid_df.columns:
+                plot_metric(
+                    pid_df,
+                    "avg_pid_decode_feedback_tbt_ms",
+                    "Mean Decode PID Feedback TBT",
+                    "Feedback TBT (ms)",
+                    outputs["pid_feedback_tbt"],
+                )
     write_report(plot_df, outputs["report"])
     return outputs
 

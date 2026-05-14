@@ -27,7 +27,7 @@ from power_control import (
 )
 
 
-DECODE_OUTPUT_LENGTHS = [8, 16, 32, 64, 128]
+DECODE_OUTPUT_LENGTHS = [8, 16, 32, 64, 96, 128]
 
 DECODE_STRATEGIES = [
     {
@@ -56,6 +56,37 @@ DECODE_STRATEGIES = [
         "power": 350,
     },
 ]
+
+DECODE_POLICY_STRATEGIES = [
+    {
+        "name": "scheme1_fit_curve",
+        "type": "bucket",
+        "bucket_key": "output_length",
+        "buckets": [(8, 150), (16, 151), (32, 191), (64, 210), (float("inf"), 220)],
+    },
+    {
+        "name": "scheme2_fit_plus",
+        "type": "bucket",
+        "bucket_key": "output_length",
+        "buckets": [(8, 150), (16, 170), (32, 200), (64, 220), (float("inf"), 230)],
+    },
+    {
+        "name": "scheme3_kv_guided",
+        "type": "bucket",
+        "bucket_key": "output_length",
+        "buckets": [(32, 190), (96, 205), (float("inf"), 210)],
+    },
+    {
+        "name": "baseline_350w",
+        "type": "fixed",
+        "power": 350,
+    },
+]
+
+DECODE_STRATEGY_SETS = {
+    "legacy": DECODE_STRATEGIES,
+    "decode_policy_eval": DECODE_POLICY_STRATEGIES,
+}
 
 RAW_FIELDNAMES = [
     "full_repeat", "strategy", "output_length", "power_limit", "actual_power_limit",
@@ -143,12 +174,33 @@ def build_decode_eval_extra_body(output_length: int, sampling_seed: int) -> Dict
     }
 
 
-def get_power_for_decode_strategy(strategy: Dict, output_length: int) -> int:
+def select_decode_strategies(strategy_set: str) -> List[Dict]:
+    if strategy_set not in DECODE_STRATEGY_SETS:
+        raise ValueError(
+            f"unknown strategy_set: {strategy_set}; "
+            f"available={sorted(DECODE_STRATEGY_SETS.keys())}"
+        )
+    return DECODE_STRATEGY_SETS[strategy_set]
+
+
+def get_power_for_decode_strategy(strategy: Dict,
+                                  output_length: int,
+                                  concurrency: Optional[int] = None) -> int:
     if strategy["type"] == "fixed":
         return int(strategy["power"])
 
+    bucket_key = strategy.get("bucket_key", "output_length")
+    if bucket_key == "output_length":
+        bucket_value = output_length
+    elif bucket_key == "concurrency":
+        if concurrency is None:
+            raise ValueError("concurrency is required for concurrency bucket strategy")
+        bucket_value = concurrency
+    else:
+        raise ValueError(f"unsupported bucket_key: {bucket_key}")
+
     for threshold, power in strategy["buckets"]:
-        if output_length <= threshold:
+        if bucket_value <= threshold:
             return int(power)
     return int(strategy["buckets"][-1][1])
 
@@ -343,6 +395,8 @@ def run_decode_strategy_evaluation(
     sudo_password: Optional[str] = None,
     skip_set_power: bool = False,
     only_strategy: Optional[str] = None,
+    strategy_set: str = "legacy",
+    sharegpt_dir: str = "./input/ShareGPT",
 ) -> Dict[str, str]:
     os.makedirs(output_dir, exist_ok=True)
     if prompt_token_count != 1:
@@ -350,7 +404,7 @@ def run_decode_strategy_evaluation(
     if concurrency <= 0:
         raise ValueError("concurrency must be positive")
 
-    strategies = DECODE_STRATEGIES
+    strategies = select_decode_strategies(strategy_set)
     if only_strategy:
         strategies = [item for item in strategies if item["name"] == only_strategy]
         if not strategies:
@@ -363,7 +417,7 @@ def run_decode_strategy_evaluation(
         base_url=base_url,
         service_request_mode="completion",
     )
-    load_generator = LoadGenerator(sharegpt_dir="", tokenizer_name=tokenizer_path)
+    load_generator = LoadGenerator(sharegpt_dir=sharegpt_dir, tokenizer_name=tokenizer_path)
     base_prompt = load_generator.generate_prompt_by_token_count(
         prompt_token_count,
         prefer_sharegpt=True,
@@ -391,8 +445,10 @@ def run_decode_strategy_evaluation(
         "output_lengths": DECODE_OUTPUT_LENGTHS,
         "warmup_batches": warmup_batches,
         "monitor_warmup_batches": monitor_warmup_batches,
+        "strategy_set": strategy_set,
+        "sharegpt_dir": sharegpt_dir,
         "order_mode": "rotate_by_full_repeat",
-        "strategies": DECODE_STRATEGIES,
+        "strategies": strategies,
     }
     write_json_file(metadata_file, metadata)
     initialize_csv_file(raw_file, RAW_FIELDNAMES)
@@ -454,7 +510,11 @@ def run_decode_strategy_evaluation(
                 )
             prompt_sets = prompt_sets_by_repeat[full_repeat]
 
-            power_limit = get_power_for_decode_strategy(strategy, output_length)
+            power_limit = get_power_for_decode_strategy(
+                strategy,
+                output_length,
+                concurrency=concurrency,
+            )
             if not skip_set_power:
                 if not set_power_cap(power_limit, sudo_password=sudo_password):
                     raise RuntimeError(
@@ -599,6 +659,13 @@ if __name__ == "__main__":
     parser.add_argument("--sudo-password", type=str, default=None)
     parser.add_argument("--skip-set-power", action="store_true")
     parser.add_argument("--only-strategy", type=str, default=None)
+    parser.add_argument(
+        "--strategy-set",
+        type=str,
+        default="legacy",
+        choices=sorted(DECODE_STRATEGY_SETS.keys()),
+    )
+    parser.add_argument("--sharegpt-dir", type=str, default="./input/ShareGPT")
     args = parser.parse_args()
 
     outputs = run_decode_strategy_evaluation(
@@ -617,6 +684,8 @@ if __name__ == "__main__":
         sudo_password=args.sudo_password,
         skip_set_power=args.skip_set_power,
         only_strategy=args.only_strategy,
+        strategy_set=args.strategy_set,
+        sharegpt_dir=args.sharegpt_dir,
     )
     print("实验完成，输出文件：")
     for key, value in outputs.items():

@@ -9,7 +9,11 @@ import math
 import os
 from typing import Dict, Optional, Sequence
 
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+
 import matplotlib.pyplot as plt
+from matplotlib import font_manager
+from matplotlib.ticker import AutoMinorLocator, MaxNLocator
 import numpy as np
 import pandas as pd
 import seaborn as sns
@@ -20,16 +24,57 @@ try:
 except ImportError:
     HAS_SCIPY = False
 
-sns.set_style("whitegrid")
-plt.rcParams["font.sans-serif"] = ["DejaVu Sans"]
+PLOT_DPI = 600
+USE_PLOT_TITLES = False
+LINE_WIDTH = 1.5
+AXIS_LINE_WIDTH = 1.0
+MARKER_SIZE = 42
+PAPER_COLORS = [
+    "#1f77b4",
+    "#d62728",
+    "#2ca02c",
+    "#9467bd",
+    "#ff7f0e",
+    "#17becf",
+    "#7f7f7f",
+]
+
+def pick_available_font(preferred_fonts: Sequence[str], fallback: str) -> str:
+    available = {font.name for font in font_manager.fontManager.ttflist}
+    for font_name in preferred_fonts:
+        if font_name in available:
+            return font_name
+    return fallback
+
+
+EN_FONT = pick_available_font(["Times New Roman", "Liberation Serif"], "DejaVu Serif")
+ZH_FONT = pick_available_font(["SimSun", "Noto Serif CJK SC", "Source Han Serif SC"], "DejaVu Sans")
+
+sns.set_style("white")
+plt.rcParams["font.family"] = [EN_FONT, ZH_FONT]
+plt.rcParams["font.sans-serif"] = [ZH_FONT, "DejaVu Sans"]
+plt.rcParams["font.serif"] = [EN_FONT, "DejaVu Serif"]
 plt.rcParams["axes.unicode_minus"] = False
+plt.rcParams["axes.linewidth"] = AXIS_LINE_WIDTH
+plt.rcParams["xtick.direction"] = "in"
+plt.rcParams["ytick.direction"] = "in"
+plt.rcParams["xtick.top"] = False
+plt.rcParams["ytick.right"] = False
+plt.rcParams["font.size"] = 9
+plt.rcParams["axes.labelsize"] = 10
+plt.rcParams["xtick.labelsize"] = 8
+plt.rcParams["ytick.labelsize"] = 8
+plt.rcParams["legend.fontsize"] = 8
 
 PREFERRED_STRATEGY_ORDER = [
+    "baseline_350w",
+    "prefill_manual_buckets",
+    "prefill_token_fit",
+    "prefill_token_fit_plus25w",
     "prefill_170w",
     "prefill_200w",
     "prefill_220w",
     "prefill_260w",
-    "baseline_350w",
 ]
 
 STRATEGY_POWER_MAP = {
@@ -104,6 +149,13 @@ def get_plot_strategy_order(df: pd.DataFrame):
     ordered = [name for name in PREFERRED_STRATEGY_ORDER if name in present]
     remainder = sorted(name for name in present if name not in ordered)
     return ordered + remainder
+
+
+def get_strategy_palette(strategy_order: Sequence[str]) -> Dict[str, str]:
+    return {
+        strategy: PAPER_COLORS[index % len(PAPER_COLORS)]
+        for index, strategy in enumerate(strategy_order)
+    }
 
 
 def normalize_input_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -345,6 +397,63 @@ def recommend_prefill_buckets(df: pd.DataFrame, ttft_threshold_pct: float = 5.0)
     return recommendations
 
 
+def apply_paper_style(ax,
+                      y_zero_floor: bool = True,
+                      legend: bool = False,
+                      rotate_xticks: bool = False):
+    ax.set_title("")
+    ax.grid(False)
+    for spine in ax.spines.values():
+        spine.set_visible(True)
+        spine.set_linewidth(AXIS_LINE_WIDTH)
+        spine.set_color("black")
+
+    ax.tick_params(
+        axis="both",
+        which="major",
+        direction="in",
+        length=4.0,
+        width=AXIS_LINE_WIDTH,
+        top=False,
+        right=False,
+    )
+    ax.tick_params(
+        axis="both",
+        which="minor",
+        direction="in",
+        length=2.0,
+        width=0.8,
+        top=False,
+        right=False,
+    )
+    ax.minorticks_on()
+    ax.xaxis.set_minor_locator(AutoMinorLocator())
+    ax.yaxis.set_minor_locator(AutoMinorLocator())
+    ax.yaxis.set_major_locator(MaxNLocator(nbins=6, prune=None))
+
+    if rotate_xticks:
+        for label in ax.get_xticklabels():
+            label.set_rotation(25)
+            label.set_ha("right")
+
+    if y_zero_floor:
+        bottom, top = ax.get_ylim()
+        if bottom >= 0:
+            ax.set_ylim(0, top * 1.05 if top > 0 else 1.0)
+
+    if legend:
+        legend_obj = ax.legend(frameon=False)
+        if legend_obj is not None:
+            for line in legend_obj.get_lines():
+                line.set_linewidth(LINE_WIDTH)
+
+
+def save_paper_figure(fig, output_path: str):
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=PLOT_DPI, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+
+
 def plot_metric(df: pd.DataFrame, metric_col: str, title: str, ylabel: str, output_path: str):
     plot_df = df.copy()
     plot_df["label"] = plot_df.apply(
@@ -353,21 +462,21 @@ def plot_metric(df: pd.DataFrame, metric_col: str, title: str, ylabel: str, outp
     )
     order = plot_df.sort_values(["query_count"])["label"].drop_duplicates().tolist()
     plot_df["label"] = pd.Categorical(plot_df["label"], categories=order, ordered=True)
-    plt.figure(figsize=(12, 7))
+    strategy_order = get_plot_strategy_order(plot_df)
+    fig, ax = plt.subplots(figsize=(7.2, 4.4))
     sns.barplot(
         data=plot_df.sort_values("label"),
         x="label",
         y=metric_col,
         hue="strategy",
-        hue_order=get_plot_strategy_order(plot_df),
+        hue_order=strategy_order,
+        palette=get_strategy_palette(strategy_order),
+        ax=ax,
     )
-    plt.title(title, fontsize=14, pad=16)
-    plt.xlabel("Query Count / Target Input Tokens", fontsize=12)
-    plt.ylabel(ylabel, fontsize=12)
-    plt.xticks(rotation=25)
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=300, bbox_inches="tight")
-    plt.close()
+    ax.set_xlabel("Query Count / Target Input Tokens")
+    ax.set_ylabel(ylabel)
+    apply_paper_style(ax, y_zero_floor=True, legend=True, rotate_xticks=True)
+    save_paper_figure(fig, output_path)
 
 
 def plot_tokens_scatter(raw_df: pd.DataFrame,
@@ -376,23 +485,23 @@ def plot_tokens_scatter(raw_df: pd.DataFrame,
                         title: str,
                         ylabel: str,
                         output_path: str):
-    plt.figure(figsize=(12, 7))
+    fig, ax = plt.subplots(figsize=(7.2, 4.4))
     if raw_df is not None and not raw_df.empty:
-        plt.scatter(
+        ax.scatter(
             raw_df["target_input_tokens"],
             raw_df[metric_col],
             alpha=0.25,
-            s=40,
-            color="tab:gray",
+            s=MARKER_SIZE,
+            color="#7f7f7f",
             label="Raw",
         )
     if filtered_df is not None and not filtered_df.empty:
-        plt.scatter(
+        ax.scatter(
             filtered_df["target_input_tokens"],
             filtered_df[metric_col],
             alpha=0.85,
-            s=60,
-            color="tab:blue",
+            s=MARKER_SIZE,
+            color=PAPER_COLORS[0],
             label="Filtered",
         )
         if HAS_SCIPY and len(filtered_df) >= 3:
@@ -403,14 +512,11 @@ def plot_tokens_scatter(raw_df: pd.DataFrame,
                 _, params, _, func = fit
                 x_smooth = np.linspace(x.min(), x.max(), 200)
                 y_smooth = func(x_smooth, *params)
-                plt.plot(x_smooth, y_smooth, color="black", linewidth=2, label="Fit")
-    plt.title(title, fontsize=14, pad=16)
-    plt.xlabel("Target Input Tokens", fontsize=12)
-    plt.ylabel(ylabel, fontsize=12)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=300, bbox_inches="tight")
-    plt.close()
+                ax.plot(x_smooth, y_smooth, color="black", linewidth=LINE_WIDTH, label="Fit")
+    ax.set_xlabel("Target Input Tokens")
+    ax.set_ylabel(ylabel)
+    apply_paper_style(ax, y_zero_floor=False, legend=True)
+    save_paper_figure(fig, output_path)
 
 
 def plot_query_label_scatter(df: pd.DataFrame,
@@ -432,21 +538,20 @@ def plot_query_label_scatter(df: pd.DataFrame,
     )
     x_positions = {label: idx for idx, label in enumerate(order)}
 
-    plt.figure(figsize=(12, 7))
-    plt.scatter(
+    fig, ax = plt.subplots(figsize=(7.2, 4.4))
+    ax.scatter(
         plot_df["label"].map(x_positions),
         plot_df[metric_col],
         alpha=0.8,
-        s=55,
+        s=MARKER_SIZE,
         color=color,
     )
-    plt.xticks(range(len(order)), order, rotation=25)
-    plt.title(title, fontsize=14, pad=16)
-    plt.xlabel("Query Count / Target Input Tokens", fontsize=12)
-    plt.ylabel(ylabel, fontsize=12)
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=300, bbox_inches="tight")
-    plt.close()
+    ax.set_xticks(range(len(order)))
+    ax.set_xticklabels(order)
+    ax.set_xlabel("Query Count / Target Input Tokens")
+    ax.set_ylabel(ylabel)
+    apply_paper_style(ax, y_zero_floor=False, rotate_xticks=True)
+    save_paper_figure(fig, output_path)
 
 
 def plot_query_label_overlay_scatter(raw_df: pd.DataFrame,
@@ -474,33 +579,31 @@ def plot_query_label_overlay_scatter(raw_df: pd.DataFrame,
     )
     x_positions = {label: idx for idx, label in enumerate(order)}
 
-    plt.figure(figsize=(12, 7))
+    fig, ax = plt.subplots(figsize=(7.2, 4.4))
     raw_points = combined[combined["series"] == "Raw"]
     filtered_points = combined[combined["series"] == "Filtered"]
-    plt.scatter(
+    ax.scatter(
         raw_points["label"].map(x_positions),
         raw_points[metric_col],
         alpha=0.25,
-        s=40,
-        color="tab:gray",
+        s=MARKER_SIZE,
+        color="#7f7f7f",
         label="Raw",
     )
-    plt.scatter(
+    ax.scatter(
         filtered_points["label"].map(x_positions),
         filtered_points[metric_col],
         alpha=0.85,
-        s=60,
-        color="tab:blue",
+        s=MARKER_SIZE,
+        color=PAPER_COLORS[0],
         label="Filtered",
     )
-    plt.xticks(range(len(order)), order, rotation=25)
-    plt.title(title, fontsize=14, pad=16)
-    plt.xlabel("Query Count / Target Input Tokens", fontsize=12)
-    plt.ylabel(ylabel, fontsize=12)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=300, bbox_inches="tight")
-    plt.close()
+    ax.set_xticks(range(len(order)))
+    ax.set_xticklabels(order)
+    ax.set_xlabel("Query Count / Target Input Tokens")
+    ax.set_ylabel(ylabel)
+    apply_paper_style(ax, y_zero_floor=False, legend=True, rotate_xticks=True)
+    save_paper_figure(fig, output_path)
 
 
 def plot_relative_metric(df: pd.DataFrame, metric: str, title: str, ylabel: str, output_path: str):
@@ -514,22 +617,22 @@ def plot_relative_metric(df: pd.DataFrame, metric: str, title: str, ylabel: str,
     )
     order.append("GEOMEAN")
     metric_df["label"] = pd.Categorical(metric_df["label"], categories=order, ordered=True)
-    plt.figure(figsize=(13, 7))
+    strategy_order = get_plot_strategy_order(metric_df)
+    fig, ax = plt.subplots(figsize=(7.6, 4.4))
     sns.barplot(
         data=metric_df.sort_values("label"),
         x="label",
         y="value",
         hue="strategy",
-        hue_order=get_plot_strategy_order(metric_df),
+        hue_order=strategy_order,
+        palette=get_strategy_palette(strategy_order),
+        ax=ax,
     )
-    plt.axhline(0.0, color="black", linewidth=1.0)
-    plt.title(title, fontsize=14, pad=16)
-    plt.xlabel("Query Count / Target Input Tokens", fontsize=12)
-    plt.ylabel(ylabel, fontsize=12)
-    plt.xticks(rotation=25)
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=300, bbox_inches="tight")
-    plt.close()
+    ax.axhline(0.0, color="black", linewidth=AXIS_LINE_WIDTH)
+    ax.set_xlabel("Query Count / Target Input Tokens")
+    ax.set_ylabel(ylabel)
+    apply_paper_style(ax, y_zero_floor=False, legend=True, rotate_xticks=True)
+    save_paper_figure(fig, output_path)
 
 
 def plot_fit_curves(raw_df: pd.DataFrame, output_dir: str) -> Dict[str, Dict]:
@@ -541,29 +644,27 @@ def plot_fit_curves(raw_df: pd.DataFrame, output_dir: str) -> Dict[str, Dict]:
     ]
 
     for metric_col, ylabel, filename in metric_configs:
-        plt.figure(figsize=(12, 7))
+        fig, ax = plt.subplots(figsize=(7.2, 4.4))
         for strategy in get_plot_strategy_order(raw_df):
             strategy_df = raw_df[raw_df["strategy"] == strategy].sort_values("target_input_tokens")
             x = strategy_df["target_input_tokens"].to_numpy(dtype=float)
             y = strategy_df[metric_col].to_numpy(dtype=float)
-            plt.scatter(x, y, alpha=0.4, s=25, label=f"{strategy} raw")
+            ax.scatter(x, y, alpha=0.45, s=28, label=f"{strategy} raw")
             fit = fit_curve(x, y)
             if fit[0] is not None:
                 name, params, r2, func = fit
                 x_smooth = np.linspace(x.min(), x.max(), 200)
                 y_smooth = func(x_smooth, *params)
-                plt.plot(x_smooth, y_smooth, linewidth=2, label=f"{strategy} {name} R²={r2:.3f}")
+                ax.plot(x_smooth, y_smooth, linewidth=LINE_WIDTH, label=f"{strategy} {name} R²={r2:.3f}")
                 fit_results.setdefault(strategy, {})[metric_col] = {
                     "function": name,
                     "params": [float(item) for item in params],
                     "r2": float(r2),
                 }
-        plt.xlabel("Target Input Tokens", fontsize=12)
-        plt.ylabel(ylabel, fontsize=12)
-        plt.title(f"{ylabel} vs Target Input Tokens", fontsize=14, pad=16)
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, filename), dpi=300, bbox_inches="tight")
-        plt.close()
+        ax.set_xlabel("Target Input Tokens")
+        ax.set_ylabel(ylabel)
+        apply_paper_style(ax, y_zero_floor=False, legend=True)
+        save_paper_figure(fig, os.path.join(output_dir, filename))
     return fit_results
 
 

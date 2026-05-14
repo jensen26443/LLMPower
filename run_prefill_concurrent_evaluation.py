@@ -8,6 +8,7 @@ TTFT / Power / Energy 表现。
 import argparse
 import csv
 import json
+import math
 import os
 import random
 import statistics
@@ -28,17 +29,36 @@ QUERY_GROUPS = [
     {"query_count": 16, "target_input_tokens": 504},
     {"query_count": 32, "target_input_tokens": 1581},
     {"query_count": 64, "target_input_tokens": 2175},
-    {"query_count": 80, "target_input_tokens": 6053},
-    {"query_count": 96, "target_input_tokens": 11106},
-    {"query_count": 128, "target_input_tokens": 22873},
+    {"query_count": 103, "target_input_tokens": 6053},
+    {"query_count": 112, "target_input_tokens": 11106},
+    {"query_count": 119, "target_input_tokens": 20295},
+]
+
+PREFILL_TOKEN_POWER_FIT = {
+    "breakpoint": 3000.0,
+    "front_linear": {
+        "slope": 0.03576230118185584,
+        "intercept": 184.63676032395085,
+    },
+    "tail_log": {
+        "scale": 9.566932909648392,
+        "intercept": 278.3867873741286,
+    },
+    "min_power_w": 150,
+    "max_power_w": 350,
+}
+
+MANUAL_PREFILL_BUCKETS = [
+    {"min_query_count": 0, "max_query_count": 16, "power": 200},
+    {"min_query_count": 17, "max_query_count": 64, "power": 220},
+    {"min_query_count": 65, "max_query_count": 10_000, "power": 260},
 ]
 
 STRATEGIES = [
-    {"name": "baseline_350w", "power": 350},
-    {"name": "prefill_170w", "power": 170},
-    {"name": "prefill_200w", "power": 200},
-    {"name": "prefill_220w", "power": 220},
-    {"name": "prefill_260w", "power": 260},
+    {"name": "baseline_350w", "type": "fixed", "power": 350},
+    {"name": "prefill_token_fit", "type": "token_fit", "power_offset_w": 0},
+    {"name": "prefill_token_fit_plus25w", "type": "token_fit", "power_offset_w": 25},
+    {"name": "prefill_manual_buckets", "type": "manual_buckets", "buckets": MANUAL_PREFILL_BUCKETS},
 ]
 
 RAW_FIELDNAMES = [
@@ -160,19 +180,58 @@ def validate_actual_power_limit(expected_power: int, actual_power: float, tolera
 
 
 def wait_for_power_limit(expected_power: int,
+                         device_index: int = 0,
                          timeout_sec: float = 3.0,
                          poll_interval_sec: float = 0.1,
                          tolerance_w: float = 5.0) -> float:
     deadline = time.time() + timeout_sec
-    last_power = get_power_cap()
+    last_power = get_power_cap(device_index=device_index)
     while time.time() <= deadline:
-        last_power = get_power_cap()
+        last_power = get_power_cap(device_index=device_index)
         if abs(float(last_power) - float(expected_power)) <= tolerance_w:
             return float(last_power)
         time.sleep(poll_interval_sec)
     raise RuntimeError(
         f"Power limit mismatch: expected {expected_power}W, got {last_power:.1f}W"
     )
+
+
+def clamp_power(power_w: float,
+                min_power_w: int = PREFILL_TOKEN_POWER_FIT["min_power_w"],
+                max_power_w: int = PREFILL_TOKEN_POWER_FIT["max_power_w"]) -> int:
+    return int(round(max(float(min_power_w), min(float(max_power_w), float(power_w)))))
+
+
+def evaluate_prefill_token_power_fit(total_input_tokens: int) -> float:
+    tokens = max(1.0, float(total_input_tokens))
+    breakpoint = float(PREFILL_TOKEN_POWER_FIT["breakpoint"])
+    if tokens <= breakpoint:
+        front = PREFILL_TOKEN_POWER_FIT["front_linear"]
+        return float(front["slope"]) * tokens + float(front["intercept"])
+    tail = PREFILL_TOKEN_POWER_FIT["tail_log"]
+    return float(tail["scale"]) * math.log(tokens / breakpoint) + float(tail["intercept"])
+
+
+def recommend_manual_bucket_power(query_count: int, buckets: Sequence[Dict]) -> int:
+    for bucket in buckets:
+        if int(bucket["min_query_count"]) <= int(query_count) <= int(bucket["max_query_count"]):
+            return int(bucket["power"])
+    return int(buckets[-1]["power"])
+
+
+def recommend_prefill_power(strategy: Dict,
+                            query_count: int,
+                            total_input_tokens: int) -> int:
+    strategy_type = strategy.get("type", "fixed")
+    if strategy_type == "fixed":
+        return int(strategy["power"])
+    if strategy_type == "token_fit":
+        power = evaluate_prefill_token_power_fit(total_input_tokens)
+        power += float(strategy.get("power_offset_w", 0))
+        return clamp_power(power)
+    if strategy_type == "manual_buckets":
+        return recommend_manual_bucket_power(query_count, strategy["buckets"])
+    raise ValueError(f"Unknown prefill strategy type: {strategy_type}")
 
 
 def select_subset_prompts(load_generator: LoadGenerator,
@@ -304,6 +363,7 @@ def run_prefill_concurrent_evaluation(output_dir: str,
                                       inter_batch_sec: float,
                                       queue_seed: int,
                                       sampling_seed: int,
+                                      device_index: int,
                                       sudo_password: Optional[str],
                                       skip_set_power: bool,
                                       strategy_names: Optional[Sequence[str]] = None):
@@ -344,6 +404,7 @@ def run_prefill_concurrent_evaluation(output_dir: str,
         "monitor_warmup_batches": monitor_warmup_batches,
         "queue_seed": queue_seed,
         "sampling_seed": sampling_seed,
+        "device_index": device_index,
         "base_url": base_url,
         "model_path": model_path,
         "served_model_name": served_model_name,
@@ -395,20 +456,27 @@ def run_prefill_concurrent_evaluation(output_dir: str,
             strategy_order = list(strategies[full_repeat - 1:]) + list(strategies[:full_repeat - 1])
 
             for strategy in strategy_order:
-                power_limit = int(strategy["power"])
-                if not skip_set_power:
-                    if not set_power_cap(power_limit, sudo_password=sudo_password):
-                        raise RuntimeError(f"Failed to set power limit {power_limit}W")
-                    actual_power_limit = wait_for_power_limit(power_limit)
-                else:
-                    actual_power_limit = get_power_cap()
-
                 for query_group in QUERY_GROUPS:
                     query_count = int(query_group["query_count"])
+                    target_input_tokens = int(query_group["target_input_tokens"])
+                    power_limit = recommend_prefill_power(
+                        strategy,
+                        query_count=query_count,
+                        total_input_tokens=target_input_tokens,
+                    )
+                    if not skip_set_power:
+                        if not set_power_cap(power_limit, device_index=device_index, sudo_password=sudo_password):
+                            raise RuntimeError(f"Failed to set power limit {power_limit}W")
+                        actual_power_limit = wait_for_power_limit(power_limit, device_index=device_index)
+                    else:
+                        actual_power_limit = get_power_cap(device_index=device_index)
+
                     current_block = {
                         "full_repeat": full_repeat,
                         "strategy_name": strategy["name"],
                         "query_count": query_count,
+                        "target_input_tokens": target_input_tokens,
+                        "power_limit": power_limit,
                     }
                     write_progress_file(
                         progress_path,
@@ -435,7 +503,7 @@ def run_prefill_concurrent_evaluation(output_dir: str,
                         )
                         time.sleep(inter_batch_sec)
 
-                    monitor = PowerMonitor(sample_interval=0.02)
+                    monitor = PowerMonitor(device_index=device_index, sample_interval=0.02)
                     monitor.start()
                     for warmup_batch in monitor_warmup_slice:
                         inferencer.infer_concurrent(
@@ -463,7 +531,7 @@ def run_prefill_concurrent_evaluation(output_dir: str,
                             "full_repeat": full_repeat,
                             "strategy": strategy["name"],
                             "query_count": query_count,
-                            "target_input_tokens": int(query_group["target_input_tokens"]),
+                            "target_input_tokens": target_input_tokens,
                             "actual_input_tokens": sum(int(item["prompt_tokens"]) for item in batch_prompts),
                             "batch_repeat": batch_repeat,
                             "power_limit": power_limit,
@@ -548,6 +616,7 @@ def parse_args():
     parser.add_argument("--inter-batch-sec", type=float, default=0.3)
     parser.add_argument("--queue-seed", type=int, default=20260401)
     parser.add_argument("--sampling-seed", type=int, default=20260401)
+    parser.add_argument("--device-index", type=int, default=0)
     parser.add_argument("--sudo-password", default=None)
     parser.add_argument("--skip-set-power", action="store_true")
     parser.add_argument("--strategy-names", default=None)
@@ -570,6 +639,7 @@ def main():
         inter_batch_sec=args.inter_batch_sec,
         queue_seed=args.queue_seed,
         sampling_seed=args.sampling_seed,
+        device_index=args.device_index,
         sudo_password=args.sudo_password,
         skip_set_power=args.skip_set_power,
         strategy_names=[item.strip() for item in args.strategy_names.split(",")] if args.strategy_names else None,

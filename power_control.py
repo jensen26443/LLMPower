@@ -42,14 +42,20 @@ def get_nvidia_smi_path():
     return 'nvidia-smi'
 
 def get_power_cap(device_index=0):
-    """获取当前GPU功率限制，单位W，使用nvidia-smi命令行兼容性更好"""
+    """获取当前GPU功率限制，单位W，使用 nvidia-smi query 避免误匹配默认功率。"""
     try:
         nvidia_smi = get_nvidia_smi_path()
         result = subprocess.run(
-            [nvidia_smi, "-i", str(device_index), "-q", "-d", "POWER"],
+            [
+                nvidia_smi,
+                "-i",
+                str(device_index),
+                "--query-gpu=power.limit",
+                "--format=csv,noheader,nounits",
+            ],
             check=True, capture_output=True, text=True
         )
-        match = re.search(r"Power Limit\s+:\s+(\d+\.?\d*)\s+W", result.stdout)
+        match = re.search(r"(\d+\.?\d*)", result.stdout)
         if match:
             return float(match.group(1))
         return 0.0

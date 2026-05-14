@@ -114,7 +114,8 @@ class LLMInferencer:
         self.llm = LLM(
             model=model_name,
             quantization="awq",
-            gpu_memory_utilization=gpu_memory_utilization
+            gpu_memory_utilization=gpu_memory_utilization,
+            enable_prefix_caching=not disable_prefix_caching,
         )
         self.sampling_params = SamplingParams(
             temperature=0.7,

@@ -14,7 +14,8 @@ import random
 import statistics
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
+from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Sequence
 
 from tqdm import tqdm
@@ -36,6 +37,8 @@ QUERY_GROUPS = [
 
 OUTPUT_LENGTHS = [100, 200]
 
+DEFAULT_PID_TARGETS_PATH = os.path.join(os.path.dirname(__file__), "feedforward_pid_targets.json")
+
 DEFAULT_PREFILL_BUCKETS = [
     (6054, 165),
     (11107, 175),
@@ -47,6 +50,27 @@ V2_PREFILL_BUCKETS = [
     (4114, 220),
     (float("inf"), 260),
 ]
+
+PID_GUARD_CONFIG = {
+    "kp_prefill": 0.1,
+    "kp_decode": 0.45,
+    "ki": 0.0,
+    "kd": 0.0,
+    "pid_interval_sec": 2.0,
+    "pid_delta_limit_w": 20.0,
+    "pid_max_step_w": 10.0,
+    "pid_min_power_change_w": 5.0,
+    "pid_deadband_ms": 1.0,
+    "pid_min_decode_samples": 4,
+    "pid_initial_skip_windows": 1,
+    "pid_decode_confirm_windows": 2,
+    "pid_decay_step_w": 5.0,
+    "pid_feedback_window_samples": 32,
+    "pid_ewma_alpha": 1.0,
+    "pid_power_max_w": 350,
+    "pid_ttft_budget_ratio": 1.05,
+    "pid_tbt_budget_ratio": 1.05,
+}
 
 STRATEGIES = [
     {
@@ -98,6 +122,14 @@ STRATEGIES = [
         "decode_recommendation_profile": "decode_tbt_guarded",
         "decode_scheme": "recommendation:decode_tbt_guarded",
     },
+    {
+        "name": "ff_decode_tbt_guarded_pid",
+        "type": "feedforward_pid_guard",
+        "prefill_buckets": V2_PREFILL_BUCKETS,
+        "decode_recommendation_profile": "decode_tbt_guarded",
+        "decode_scheme": "recommendation:decode_tbt_guarded+pid_guard",
+        "pid_enabled": True,
+    },
 ]
 
 RAW_FIELDNAMES = [
@@ -110,8 +142,16 @@ RAW_FIELDNAMES = [
     "batch_repeat",
     "prefill_power_limit",
     "decode_scheme",
+    "pid_enabled",
+    "pid_update_count",
+    "pid_prefill_delta_w",
+    "pid_decode_delta_w",
+    "pid_prefill_error_ms",
+    "pid_decode_error_ms",
+    "pid_decode_feedback_tbt_ms",
     "power_change_count",
     "power_event_trace_json",
+    "pid_event_trace_json",
     "avg_ttft_ms",
     "p50_ttft_ms",
     "p95_ttft_ms",
@@ -142,6 +182,7 @@ AGG_FIELDNAMES = [
     "output_length",
     "prefill_power_limit",
     "decode_scheme",
+    "pid_enabled",
     "num_samples",
     "avg_ttft_ms",
     "avg_tbt_ms",
@@ -150,6 +191,13 @@ AGG_FIELDNAMES = [
     "avg_power_w",
     "avg_sm_clock_mhz",
     "avg_mem_clock_mhz",
+    "avg_power_change_count",
+    "avg_pid_update_count",
+    "avg_pid_prefill_delta_w",
+    "avg_pid_decode_delta_w",
+    "avg_pid_prefill_error_ms",
+    "avg_pid_decode_error_ms",
+    "avg_pid_decode_feedback_tbt_ms",
 ]
 
 
@@ -167,6 +215,89 @@ def get_decode_power_for_kvb(strategy: Dict, kvb: float) -> int:
         if kvb <= threshold:
             return int(power)
     return int(strategy["decode_buckets"][-1][1])
+
+
+def clamp(value: float, lower: float, upper: float) -> float:
+    return max(lower, min(upper, value))
+
+
+def clamp_power_step(current_power: int, desired_power: int, max_step_w: int) -> int:
+    delta = int(round(desired_power - current_power))
+    if delta > max_step_w:
+        return int(current_power + max_step_w)
+    if delta < -max_step_w:
+        return int(current_power - max_step_w)
+    return int(round(desired_power))
+
+
+@dataclass
+class PIDState:
+    kp: float
+    ki: float
+    kd: float
+    output_limit_w: float
+    integral_limit: float = 5000.0
+    integral: float = 0.0
+    prev_error: Optional[float] = None
+    delta_w: float = 0.0
+
+    def update(self, actual_value: float, target_value: float) -> Dict[str, float]:
+        error = float(actual_value) - float(target_value)
+        self.integral = clamp(
+            self.integral + error,
+            -self.integral_limit,
+            self.integral_limit,
+        )
+        derivative = 0.0 if self.prev_error is None else error - self.prev_error
+        self.prev_error = error
+        raw_delta = self.kp * error + self.ki * self.integral + self.kd * derivative
+        self.delta_w = clamp(raw_delta, 0.0, self.output_limit_w)
+        return {
+            "error": error,
+            "delta_w": self.delta_w,
+            "integral": self.integral,
+            "derivative": derivative,
+        }
+
+
+def load_pid_targets(path: str) -> Dict[str, Dict[str, float]]:
+    with open(path, "r", encoding="utf-8") as file_obj:
+        payload = json.load(file_obj)
+    if not isinstance(payload, dict) or not payload:
+        raise ValueError(f"Invalid PID target file: {path}")
+    return payload
+
+
+def get_pid_targets_for_query(targets: Dict[str, Dict[str, float]],
+                              query_count: int,
+                              output_length: int,
+                              ttft_budget_ratio: float = PID_GUARD_CONFIG["pid_ttft_budget_ratio"],
+                              tbt_budget_ratio: float = PID_GUARD_CONFIG["pid_tbt_budget_ratio"]) -> Dict[str, float]:
+    key = f"{int(query_count)}/{int(output_length)}"
+    if key not in targets:
+        raise KeyError(f"Missing PID target for {key}")
+    item = targets[key]
+    ttft_source = "baseline"
+    tbt_source = "baseline"
+    ttft_base = float(item["ttft_baseline_ms"])
+    tbt_base = float(item["tbt_baseline_ms"])
+    for candidate in ("ttft_ff_ms", "ff_ttft_ms", "ttft_feedforward_ms", "feedforward_ttft_ms"):
+        if candidate in item:
+            ttft_base = float(item[candidate])
+            ttft_source = "feedforward"
+            break
+    for candidate in ("tbt_ff_ms", "ff_tbt_ms", "tbt_feedforward_ms", "feedforward_tbt_ms"):
+        if candidate in item:
+            tbt_base = float(item[candidate])
+            tbt_source = "feedforward"
+            break
+    return {
+        "ttft_baseline_ms": ttft_base,
+        "tbt_baseline_ms": tbt_base,
+        "ttft_target_ms": ttft_base * float(ttft_budget_ratio),
+        "tbt_target_ms": tbt_base * float(tbt_budget_ratio),
+        "target_source": "feedforward" if ttft_source == "feedforward" and tbt_source == "feedforward" else "baseline",
+    }
 
 
 def load_decode_bucket_recommendations(file_path: str) -> Dict:
@@ -213,7 +344,8 @@ def prepare_strategy_for_block(strategy: Dict,
     )
     prepared = dict(strategy)
     prepared["decode_buckets"] = [(float("inf"), int(decode_power))]
-    prepared["decode_scheme"] = f"fixed_decode_{int(decode_power)}"
+    suffix = "+pid_guard" if strategy.get("pid_enabled") else ""
+    prepared["decode_scheme"] = f"fixed_decode_{int(decode_power)}{suffix}"
     return prepared
 
 
@@ -371,6 +503,9 @@ def summarize_request_metrics(results: List[Dict]) -> Dict[str, float]:
 
 
 def aggregate_raw_rows(raw_rows: List[Dict]) -> List[Dict]:
+    def mean_or_zero(values: List[float]) -> float:
+        return statistics.mean(values) if values else 0.0
+
     grouped = defaultdict(list)
     for row in raw_rows:
         key = (
@@ -379,8 +514,8 @@ def aggregate_raw_rows(raw_rows: List[Dict]) -> List[Dict]:
             row["query_count"],
             row["target_input_tokens"],
             row["output_length"],
-            row["prefill_power_limit"],
             row["decode_scheme"],
+            row.get("pid_enabled", 0),
         )
         grouped[key].append(row)
 
@@ -394,8 +529,9 @@ def aggregate_raw_rows(raw_rows: List[Dict]) -> List[Dict]:
             "target_input_tokens": key[3],
             "actual_input_tokens": avg_input_tokens,
             "output_length": key[4],
-            "prefill_power_limit": key[5],
-            "decode_scheme": key[6],
+            "prefill_power_limit": statistics.mean(float(item["prefill_power_limit"]) for item in rows),
+            "decode_scheme": key[5],
+            "pid_enabled": key[6],
             "num_samples": len(rows),
             "avg_ttft_ms": statistics.mean(float(item["avg_ttft_ms"]) for item in rows),
             "avg_tbt_ms": statistics.mean(float(item["avg_tbt_ms"]) for item in rows),
@@ -404,6 +540,25 @@ def aggregate_raw_rows(raw_rows: List[Dict]) -> List[Dict]:
             "avg_power_w": statistics.mean(float(item["avg_power_w"]) for item in rows),
             "avg_sm_clock_mhz": statistics.mean(float(item["avg_sm_clock_mhz"]) for item in rows),
             "avg_mem_clock_mhz": statistics.mean(float(item["avg_mem_clock_mhz"]) for item in rows),
+            "avg_power_change_count": statistics.mean(float(item.get("power_change_count", 0.0)) for item in rows),
+            "avg_pid_update_count": statistics.mean(float(item.get("pid_update_count", 0.0)) for item in rows),
+            "avg_pid_prefill_delta_w": statistics.mean(float(item.get("pid_prefill_delta_w", 0.0)) for item in rows),
+            "avg_pid_decode_delta_w": statistics.mean(float(item.get("pid_decode_delta_w", 0.0)) for item in rows),
+            "avg_pid_prefill_error_ms": mean_or_zero([
+                float(item["pid_prefill_error_ms"])
+                for item in rows
+                if item.get("pid_prefill_error_ms") not in ("", None)
+            ]),
+            "avg_pid_decode_error_ms": mean_or_zero([
+                float(item["pid_decode_error_ms"])
+                for item in rows
+                if item.get("pid_decode_error_ms") not in ("", None)
+            ]),
+            "avg_pid_decode_feedback_tbt_ms": mean_or_zero([
+                float(item["pid_decode_feedback_tbt_ms"])
+                for item in rows
+                if item.get("pid_decode_feedback_tbt_ms") not in ("", None)
+            ]),
         })
     return aggregated
 
@@ -586,6 +741,361 @@ class FeedforwardController:
             self._apply_power(next_power, reason="decode", wall_time=wall_time, kvb=kvb)
 
 
+class FeedforwardPIDGuardController:
+    def __init__(self,
+                 strategy: Dict,
+                 prompt_token_counts: Sequence[int],
+                 total_input_tokens: int,
+                 routing_input_tokens: Optional[int],
+                 set_power_callback: Callable[[int, bool], bool],
+                 target_metrics: Dict[str, float],
+                 pid_config: Optional[Dict[str, float]] = None,
+                 prefill_pid_state: Optional[PIDState] = None):
+        self.strategy = strategy
+        self.prompt_token_counts = [int(value) for value in prompt_token_counts]
+        self.total_input_tokens = int(total_input_tokens)
+        self.routing_input_tokens = int(routing_input_tokens if routing_input_tokens is not None else total_input_tokens)
+        self.set_power_callback = set_power_callback
+        self.target_metrics = target_metrics
+        self.pid_config = pid_config or PID_GUARD_CONFIG
+        self.prefill_pid_state = prefill_pid_state
+
+        self.generated_token_counts = [0] * len(self.prompt_token_counts)
+        self.finished = [False] * len(self.prompt_token_counts)
+        self.first_token_wall_times: List[Optional[float]] = [None] * len(self.prompt_token_counts)
+        self.last_token_wall_times: List[Optional[float]] = [None] * len(self.prompt_token_counts)
+        self._last_tbt_sample_wall_times: List[Optional[float]] = [None] * len(self.prompt_token_counts)
+        self._last_tbt_sample_tokens = [0] * len(self.prompt_token_counts)
+        self._recent_tbt_samples_ms = deque(
+            maxlen=int(self.pid_config.get("pid_feedback_window_samples", 32))
+        )
+
+        self._lock = threading.Lock()
+        self.prefill_base_power_limit: Optional[int] = None
+        self.prefill_power_limit: Optional[int] = None
+        self.current_power_limit: Optional[int] = None
+        self.current_decode_base_power: Optional[int] = None
+
+        self.power_change_count = 0
+        self.power_event_trace: List[Dict] = []
+        self.pid_event_trace: List[Dict] = []
+        self.pid_update_count = 0
+        self.pid_prefill_delta_w = float(prefill_pid_state.delta_w) if prefill_pid_state is not None else 0.0
+        self.pid_decode_delta_w = 0.0
+        self.pid_prefill_error_ms: Optional[float] = None
+        self.pid_decode_error_ms: Optional[float] = None
+        self.pid_decode_feedback_tbt_ms: Optional[float] = None
+        self._last_decode_pid_wall_time: Optional[float] = None
+        self._smoothed_feedback_tbt_ms: Optional[float] = None
+        self._decode_feedback_window_count = 0
+        self._decode_over_budget_windows = 0
+        self.decode_pid_state = PIDState(
+            kp=float(self.pid_config["kp_decode"]),
+            ki=float(self.pid_config["ki"]),
+            kd=float(self.pid_config["kd"]),
+            output_limit_w=float(self.pid_config["pid_delta_limit_w"]),
+        )
+
+    def _clip_power(self, desired_power: float, base_power: float) -> int:
+        return int(round(clamp(
+            float(desired_power),
+            float(base_power),
+            float(self.pid_config.get("pid_power_max_w", 350)),
+        )))
+
+    def _apply_power(self,
+                     desired_power: float,
+                     reason: str,
+                     base_power: float,
+                     wall_time: Optional[float] = None,
+                     kvb: Optional[float] = None,
+                     pid_delta: Optional[float] = None,
+                     pid_error: Optional[float] = None,
+                     verify: bool = False) -> bool:
+        desired = self._clip_power(desired_power, base_power=base_power)
+        if self.current_power_limit is not None:
+            min_change_w = float(self.pid_config.get("pid_min_power_change_w", 0.0))
+            if abs(float(desired) - float(self.current_power_limit)) < min_change_w:
+                return False
+            next_power = clamp_power_step(
+                current_power=int(self.current_power_limit),
+                desired_power=desired,
+                max_step_w=int(self.pid_config["pid_max_step_w"]),
+            )
+        else:
+            next_power = desired
+        if self.current_power_limit == next_power:
+            return False
+        if not self.set_power_callback(next_power, verify):
+            raise RuntimeError(f"Failed to set GPU power cap to {next_power}W")
+        if self.current_power_limit is not None:
+            self.power_change_count += 1
+        self.current_power_limit = int(next_power)
+        self.power_event_trace.append({
+            "power_limit": int(next_power),
+            "reason": reason,
+            "wall_time": wall_time,
+            "kvb": kvb,
+            "base_power": float(base_power),
+            "pid_delta_w": pid_delta,
+            "pid_error_ms": pid_error,
+        })
+        return True
+
+    def start(self) -> int:
+        with self._lock:
+            base_power = get_prefill_power_for_total_tokens(
+                self.routing_input_tokens,
+                prefill_buckets=self.strategy.get("prefill_buckets"),
+            )
+            self.prefill_base_power_limit = int(base_power)
+            desired_power = float(base_power) + self.pid_prefill_delta_w
+            self._apply_power(
+                desired_power,
+                reason="prefill",
+                base_power=base_power,
+                pid_delta=self.pid_prefill_delta_w,
+                verify=True,
+            )
+            self.prefill_power_limit = int(self.current_power_limit)
+            return int(self.prefill_power_limit)
+
+    def _estimate_decode_feedback_tbt_ms(self) -> Optional[float]:
+        estimates = []
+        for first_wall, last_wall, generated_tokens in zip(
+            self.first_token_wall_times,
+            self.last_token_wall_times,
+            self.generated_token_counts,
+        ):
+            if first_wall is None or last_wall is None or int(generated_tokens) <= 1:
+                continue
+            estimates.append((float(last_wall) - float(first_wall)) * 1000.0 / (int(generated_tokens) - 1))
+        if not estimates:
+            return None
+        raw_feedback = (
+            float(statistics.median(self._recent_tbt_samples_ms))
+            if self._recent_tbt_samples_ms
+            else float(statistics.median(estimates))
+        )
+        alpha = float(self.pid_config.get("pid_ewma_alpha", 1.0))
+        if self._smoothed_feedback_tbt_ms is None:
+            self._smoothed_feedback_tbt_ms = raw_feedback
+        else:
+            self._smoothed_feedback_tbt_ms = alpha * raw_feedback + (1.0 - alpha) * self._smoothed_feedback_tbt_ms
+        return float(self._smoothed_feedback_tbt_ms)
+
+    def _count_decode_pid_samples(self) -> int:
+        return sum(
+            1
+            for first_wall, last_wall, generated_tokens in zip(
+                self.first_token_wall_times,
+                self.last_token_wall_times,
+                self.generated_token_counts,
+            )
+            if first_wall is not None
+            and last_wall is not None
+            and int(generated_tokens) > 1
+        )
+
+    def handle_stream_event(self, event: Dict):
+        with self._lock:
+            request_index = int(event["request_index"])
+            event_type = event["event_type"]
+            generated_tokens = int(event.get("generated_tokens", 0))
+            wall_time = float(event.get("wall_time", time.time()))
+
+            if 0 <= request_index < len(self.generated_token_counts):
+                previous_sample_wall = self._last_tbt_sample_wall_times[request_index]
+                previous_sample_tokens = self._last_tbt_sample_tokens[request_index]
+                if (
+                    event_type in {"chunk", "finished"}
+                    and previous_sample_wall is not None
+                    and generated_tokens > previous_sample_tokens
+                    and wall_time > previous_sample_wall
+                ):
+                    sample_tbt_ms = (wall_time - previous_sample_wall) * 1000.0 / (
+                        generated_tokens - previous_sample_tokens
+                    )
+                    if sample_tbt_ms > 0:
+                        self._recent_tbt_samples_ms.append(float(sample_tbt_ms))
+
+                self.generated_token_counts[request_index] = max(
+                    self.generated_token_counts[request_index],
+                    generated_tokens,
+                )
+                if event_type == "first_token" and self.first_token_wall_times[request_index] is None:
+                    self.first_token_wall_times[request_index] = wall_time
+                if event_type in {"first_token", "chunk", "finished"}:
+                    self.last_token_wall_times[request_index] = wall_time
+                    if generated_tokens > 0:
+                        self._last_tbt_sample_wall_times[request_index] = wall_time
+                        self._last_tbt_sample_tokens[request_index] = max(previous_sample_tokens, generated_tokens)
+                if event_type == "finished":
+                    self.finished[request_index] = True
+
+            if event_type not in {"first_token", "chunk", "finished"}:
+                return
+
+            kvb = compute_kvb(
+                prompt_token_counts=self.prompt_token_counts,
+                generated_token_counts=self.generated_token_counts,
+                finished=self.finished,
+            )
+            if kvb <= 0:
+                return
+            base_decode_power = get_decode_power_for_kvb(self.strategy, kvb)
+            self.current_decode_base_power = int(base_decode_power)
+            self._apply_power(
+                float(base_decode_power) + self.pid_decode_delta_w,
+                reason="decode_feedforward",
+                wall_time=wall_time,
+                kvb=kvb,
+                base_power=base_decode_power,
+                pid_delta=self.pid_decode_delta_w,
+            )
+
+            if self._last_decode_pid_wall_time is None:
+                self._last_decode_pid_wall_time = wall_time
+                return
+            if wall_time - self._last_decode_pid_wall_time < float(self.pid_config["pid_interval_sec"]):
+                return
+            if self._count_decode_pid_samples() < int(self.pid_config["pid_min_decode_samples"]):
+                self._last_decode_pid_wall_time = wall_time
+                return
+            estimate_tbt = self._estimate_decode_feedback_tbt_ms()
+            if estimate_tbt is None:
+                self._last_decode_pid_wall_time = wall_time
+                return
+            error = float(estimate_tbt) - float(self.target_metrics["tbt_target_ms"])
+            self.pid_decode_error_ms = error
+            self.pid_decode_feedback_tbt_ms = float(estimate_tbt)
+            self._decode_feedback_window_count += 1
+            if self._decode_feedback_window_count <= int(self.pid_config.get("pid_initial_skip_windows", 0)):
+                self._last_decode_pid_wall_time = wall_time
+                self.pid_event_trace.append({
+                    "stage": "decode",
+                    "action": "skip_initial",
+                    "wall_time": wall_time,
+                    "kvb": kvb,
+                    "base_power": int(base_decode_power),
+                    "actual_tbt_ms": float(estimate_tbt),
+                    "target_tbt_ms": float(self.target_metrics["tbt_target_ms"]),
+                    "pid_error_ms": error,
+                    "pid_delta_w": self.pid_decode_delta_w,
+                })
+                return
+            if error <= float(self.pid_config["pid_deadband_ms"]):
+                self._decode_over_budget_windows = 0
+                if self.pid_decode_delta_w > 0.0:
+                    self.pid_decode_delta_w = max(
+                        0.0,
+                        self.pid_decode_delta_w - float(self.pid_config.get("pid_decay_step_w", 0.0)),
+                    )
+                    self.decode_pid_state.delta_w = self.pid_decode_delta_w
+                    self.pid_update_count += 1
+                    self.pid_event_trace.append({
+                        "stage": "decode",
+                        "action": "decay",
+                        "wall_time": wall_time,
+                        "kvb": kvb,
+                        "base_power": int(base_decode_power),
+                        "actual_tbt_ms": float(estimate_tbt),
+                        "target_tbt_ms": float(self.target_metrics["tbt_target_ms"]),
+                        "pid_error_ms": error,
+                        "pid_delta_w": self.pid_decode_delta_w,
+                    })
+                    self._apply_power(
+                        float(base_decode_power) + self.pid_decode_delta_w,
+                        reason="pid_decode_decay",
+                        wall_time=wall_time,
+                        kvb=kvb,
+                        base_power=base_decode_power,
+                        pid_delta=self.pid_decode_delta_w,
+                        pid_error=self.pid_decode_error_ms,
+                    )
+                    self._last_decode_pid_wall_time = wall_time
+                    return
+                self._last_decode_pid_wall_time = wall_time
+                self.pid_event_trace.append({
+                    "stage": "decode",
+                    "action": "hold",
+                    "wall_time": wall_time,
+                    "kvb": kvb,
+                    "base_power": int(base_decode_power),
+                    "actual_tbt_ms": float(estimate_tbt),
+                    "target_tbt_ms": float(self.target_metrics["tbt_target_ms"]),
+                    "pid_error_ms": error,
+                    "pid_delta_w": self.pid_decode_delta_w,
+                })
+                return
+
+            self._decode_over_budget_windows += 1
+            if self._decode_over_budget_windows < int(self.pid_config.get("pid_decode_confirm_windows", 1)):
+                self._last_decode_pid_wall_time = wall_time
+                self.pid_event_trace.append({
+                    "stage": "decode",
+                    "action": "hold_over_confirm",
+                    "wall_time": wall_time,
+                    "kvb": kvb,
+                    "base_power": int(base_decode_power),
+                    "actual_tbt_ms": float(estimate_tbt),
+                    "target_tbt_ms": float(self.target_metrics["tbt_target_ms"]),
+                    "pid_error_ms": error,
+                    "pid_delta_w": self.pid_decode_delta_w,
+                    "over_budget_windows": self._decode_over_budget_windows,
+                })
+                return
+
+            update = self.decode_pid_state.update(
+                actual_value=estimate_tbt,
+                target_value=float(self.target_metrics["tbt_target_ms"]),
+            )
+            self.pid_update_count += 1
+            self.pid_decode_delta_w = float(update["delta_w"])
+            self.pid_decode_error_ms = float(update["error"])
+            self.pid_event_trace.append({
+                "stage": "decode",
+                "action": "raise",
+                "wall_time": wall_time,
+                "kvb": kvb,
+                "base_power": int(base_decode_power),
+                "actual_tbt_ms": float(estimate_tbt),
+                "target_tbt_ms": float(self.target_metrics["tbt_target_ms"]),
+                "pid_error_ms": self.pid_decode_error_ms,
+                "pid_delta_w": self.pid_decode_delta_w,
+            })
+            self._apply_power(
+                float(base_decode_power) + self.pid_decode_delta_w,
+                reason="pid_decode",
+                wall_time=wall_time,
+                kvb=kvb,
+                base_power=base_decode_power,
+                pid_delta=self.pid_decode_delta_w,
+                pid_error=self.pid_decode_error_ms,
+            )
+            self._last_decode_pid_wall_time = wall_time
+
+    def finalize_batch(self, metric_stats: Dict[str, float]):
+        if self.prefill_pid_state is None:
+            return
+        update = self.prefill_pid_state.update(
+            actual_value=float(metric_stats["avg_ttft_ms"]),
+            target_value=float(self.target_metrics["ttft_target_ms"]),
+        )
+        self.pid_update_count += 1
+        self.pid_prefill_delta_w = float(update["delta_w"])
+        self.pid_prefill_error_ms = float(update["error"])
+        self.pid_event_trace.append({
+            "stage": "prefill",
+            "base_power": self.prefill_base_power_limit,
+            "applied_power": self.prefill_power_limit,
+            "actual_ttft_ms": float(metric_stats["avg_ttft_ms"]),
+            "target_ttft_ms": float(self.target_metrics["ttft_target_ms"]),
+            "pid_error_ms": self.pid_prefill_error_ms,
+            "next_pid_delta_w": self.pid_prefill_delta_w,
+        })
+
+
 def run_feedforward_evaluation(output_dir: str,
                                model_path: str,
                                served_model_name: str,
@@ -604,7 +1114,9 @@ def run_feedforward_evaluation(output_dir: str,
                                skip_set_power: bool,
                                strategy_names: Optional[Sequence[str]] = None,
                                only_strategy: Optional[str] = None,
-                               decode_recommendation_json: Optional[str] = None):
+                               decode_recommendation_json: Optional[str] = None,
+                               pid_targets_path: str = DEFAULT_PID_TARGETS_PATH,
+                               pid_config: Optional[Dict[str, float]] = None):
     os.makedirs(output_dir, exist_ok=True)
     experiment_id = f"feedforward_eval_{int(time.time())}"
     raw_path = os.path.join(output_dir, f"{experiment_id}_raw.csv")
@@ -633,6 +1145,13 @@ def run_feedforward_evaluation(output_dir: str,
             raise ValueError("Selected decode recommendation strategies require --decode-recommendation-json")
         decode_recommendations = load_decode_bucket_recommendations(decode_recommendation_json)
 
+    effective_pid_config = dict(PID_GUARD_CONFIG)
+    if pid_config:
+        effective_pid_config.update(pid_config)
+    pid_targets = None
+    if any(item.get("pid_enabled") for item in strategies):
+        pid_targets = load_pid_targets(pid_targets_path)
+
     inferencer = LLMInferencer(
         model_name=model_path,
         use_service=True,
@@ -660,6 +1179,8 @@ def run_feedforward_evaluation(output_dir: str,
         "sharegpt_dir": sharegpt_dir,
         "skip_set_power": skip_set_power,
         "decode_recommendation_json": decode_recommendation_json,
+        "pid_targets_path": pid_targets_path if pid_targets is not None else None,
+        "pid_config": effective_pid_config if pid_targets is not None else None,
         "started_at": time.time(),
     }
     write_json_file(metadata_path, metadata)
@@ -743,6 +1264,24 @@ def run_feedforward_evaluation(output_dir: str,
                             output_length=int(output_length),
                             sampling_seed=sampling_seed,
                         )
+                        target_metrics = None
+                        prefill_pid_state = None
+                        if strategy.get("pid_enabled"):
+                            if pid_targets is None:
+                                raise RuntimeError("PID targets were not loaded")
+                            target_metrics = get_pid_targets_for_query(
+                                pid_targets,
+                                query_count=query_count,
+                                output_length=int(output_length),
+                                ttft_budget_ratio=float(effective_pid_config["pid_ttft_budget_ratio"]),
+                                tbt_budget_ratio=float(effective_pid_config["pid_tbt_budget_ratio"]),
+                            )
+                            prefill_pid_state = PIDState(
+                                kp=float(effective_pid_config["kp_prefill"]),
+                                ki=float(effective_pid_config["ki"]),
+                                kd=float(effective_pid_config["kd"]),
+                                output_limit_w=float(effective_pid_config["pid_delta_limit_w"]),
+                            )
 
                         block_rows = []
                         for warmup_batch in warmup_slice:
@@ -766,13 +1305,25 @@ def run_feedforward_evaluation(output_dir: str,
                             )
                             prompt_token_counts = [int(item["prompt_tokens"]) for item in batch_prompts]
                             total_input_tokens = sum(prompt_token_counts)
-                            controller = FeedforwardController(
-                                strategy=block_strategy,
-                                prompt_token_counts=prompt_token_counts,
-                                total_input_tokens=total_input_tokens,
-                                routing_input_tokens=int(query_group["target_input_tokens"]),
-                                set_power_callback=apply_power_cap,
-                            )
+                            if strategy.get("pid_enabled"):
+                                controller = FeedforwardPIDGuardController(
+                                    strategy=block_strategy,
+                                    prompt_token_counts=prompt_token_counts,
+                                    total_input_tokens=total_input_tokens,
+                                    routing_input_tokens=int(query_group["target_input_tokens"]),
+                                    set_power_callback=apply_power_cap,
+                                    target_metrics=target_metrics,
+                                    pid_config=effective_pid_config,
+                                    prefill_pid_state=prefill_pid_state,
+                                )
+                            else:
+                                controller = FeedforwardController(
+                                    strategy=block_strategy,
+                                    prompt_token_counts=prompt_token_counts,
+                                    total_input_tokens=total_input_tokens,
+                                    routing_input_tokens=int(query_group["target_input_tokens"]),
+                                    set_power_callback=apply_power_cap,
+                                )
                             prefill_power_limit = controller.start()
 
                             for warmup_monitor_batch in monitor_warmup_slice if batch_repeat == 1 else []:
@@ -807,6 +1358,8 @@ def run_feedforward_evaluation(output_dir: str,
                             power_data = power_monitor.stop()
                             power_stats = build_power_window_stats(wall_start, wall_end, power_data)
                             metric_stats = summarize_request_metrics(results)
+                            if hasattr(controller, "finalize_batch"):
+                                controller.finalize_batch(metric_stats)
 
                             row = {
                                 "full_repeat": full_repeat,
@@ -818,8 +1371,16 @@ def run_feedforward_evaluation(output_dir: str,
                                 "batch_repeat": batch_repeat,
                                 "prefill_power_limit": prefill_power_limit,
                                 "decode_scheme": block_strategy["decode_scheme"],
+                                "pid_enabled": int(bool(strategy.get("pid_enabled"))),
+                                "pid_update_count": getattr(controller, "pid_update_count", 0),
+                                "pid_prefill_delta_w": getattr(controller, "pid_prefill_delta_w", 0.0),
+                                "pid_decode_delta_w": getattr(controller, "pid_decode_delta_w", 0.0),
+                                "pid_prefill_error_ms": getattr(controller, "pid_prefill_error_ms", None) or "",
+                                "pid_decode_error_ms": getattr(controller, "pid_decode_error_ms", None) or "",
+                                "pid_decode_feedback_tbt_ms": getattr(controller, "pid_decode_feedback_tbt_ms", None) or "",
                                 "power_change_count": controller.power_change_count,
                                 "power_event_trace_json": json.dumps(controller.power_event_trace, ensure_ascii=False),
+                                "pid_event_trace_json": json.dumps(getattr(controller, "pid_event_trace", []), ensure_ascii=False),
                                 **metric_stats,
                                 **power_stats,
                             }
@@ -896,12 +1457,38 @@ def parse_args():
     parser.add_argument("--strategy-names", default=None)
     parser.add_argument("--only-strategy", default=None)
     parser.add_argument("--decode-recommendation-json", default=None)
+    parser.add_argument("--pid-targets-path", default=DEFAULT_PID_TARGETS_PATH)
+    parser.add_argument("--pid-ttft-budget-ratio", type=float, default=PID_GUARD_CONFIG["pid_ttft_budget_ratio"])
+    parser.add_argument("--pid-tbt-budget-ratio", type=float, default=PID_GUARD_CONFIG["pid_tbt_budget_ratio"])
+    parser.add_argument("--pid-interval-sec", type=float, default=PID_GUARD_CONFIG["pid_interval_sec"])
+    parser.add_argument("--pid-delta-limit-w", type=float, default=PID_GUARD_CONFIG["pid_delta_limit_w"])
+    parser.add_argument("--pid-max-step-w", type=float, default=PID_GUARD_CONFIG["pid_max_step_w"])
+    parser.add_argument("--pid-min-power-change-w", type=float, default=PID_GUARD_CONFIG["pid_min_power_change_w"])
+    parser.add_argument("--pid-deadband-ms", type=float, default=PID_GUARD_CONFIG["pid_deadband_ms"])
+    parser.add_argument("--pid-min-decode-samples", type=int, default=PID_GUARD_CONFIG["pid_min_decode_samples"])
+    parser.add_argument("--pid-initial-skip-windows", type=int, default=PID_GUARD_CONFIG["pid_initial_skip_windows"])
+    parser.add_argument("--pid-decode-confirm-windows", type=int, default=PID_GUARD_CONFIG["pid_decode_confirm_windows"])
+    parser.add_argument("--pid-decay-step-w", type=float, default=PID_GUARD_CONFIG["pid_decay_step_w"])
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
     output_lengths = [int(item.strip()) for item in args.output_lengths.split(",") if item.strip()]
+    pid_config = dict(PID_GUARD_CONFIG)
+    pid_config.update({
+        "pid_ttft_budget_ratio": args.pid_ttft_budget_ratio,
+        "pid_tbt_budget_ratio": args.pid_tbt_budget_ratio,
+        "pid_interval_sec": args.pid_interval_sec,
+        "pid_delta_limit_w": args.pid_delta_limit_w,
+        "pid_max_step_w": args.pid_max_step_w,
+        "pid_min_power_change_w": args.pid_min_power_change_w,
+        "pid_deadband_ms": args.pid_deadband_ms,
+        "pid_min_decode_samples": args.pid_min_decode_samples,
+        "pid_initial_skip_windows": args.pid_initial_skip_windows,
+        "pid_decode_confirm_windows": args.pid_decode_confirm_windows,
+        "pid_decay_step_w": args.pid_decay_step_w,
+    })
     run_feedforward_evaluation(
         output_dir=args.output_dir,
         model_path=args.model_path,
@@ -922,6 +1509,8 @@ def main():
         strategy_names=[item.strip() for item in args.strategy_names.split(",")] if args.strategy_names else None,
         only_strategy=args.only_strategy,
         decode_recommendation_json=args.decode_recommendation_json,
+        pid_targets_path=args.pid_targets_path,
+        pid_config=pid_config,
     )
 
 

@@ -1,0 +1,54 @@
+{
+  "experiment_id": "prefill_concurrent_eval_1777953084",
+  "strategies": [
+    "baseline_350w",
+    "prefill_token_fit",
+    "prefill_token_fit_plus25w",
+    "prefill_manual_buckets"
+  ],
+  "query_groups": [
+    {
+      "query_count": 8,
+      "target_input_tokens": 225
+    },
+    {
+      "query_count": 16,
+      "target_input_tokens": 504
+    },
+    {
+      "query_count": 32,
+      "target_input_tokens": 1581
+    },
+    {
+      "query_count": 64,
+      "target_input_tokens": 2175
+    },
+    {
+      "query_count": 103,
+      "target_input_tokens": 6053
+    },
+    {
+      "query_count": 112,
+      "target_input_tokens": 11106
+    },
+    {
+      "query_count": 119,
+      "target_input_tokens": 20295
+    }
+  ],
+  "repeats_per_batch": 50,
+  "full_repeats": 3,
+  "warmup_batches": 2,
+  "monitor_warmup_batches": 1,
+  "queue_seed": 20260401,
+  "sampling_seed": 20260401,
+  "device_index": 0,
+  "base_url": "http://localhost:8000/v1",
+  "model_path": "./Qwen2.5-7B-Instruct-AWQ",
+  "served_model_name": "Qwen2.5-7B-Instruct-AWQ",
+  "tokenizer_path": "./Qwen2.5-7B-Instruct-AWQ",
+  "sharegpt_dir": "./input/ShareGPT",
+  "skip_set_power": false,
+  "started_at": 1777953104.8605034,
+  "finished_at": 1777960894.7605991
+}

@@ -1,0 +1,99 @@
+{
+  "timestamp": 1777989123.29882,
+  "repeats_per_batch": 50,
+  "full_repeats": 3,
+  "concurrency": 8,
+  "output_lengths": [
+    8,
+    16,
+    32,
+    64,
+    96,
+    128
+  ],
+  "warmup_batches": 3,
+  "monitor_warmup_batches": 1,
+  "strategy_set": "decode_policy_eval",
+  "sharegpt_dir": "./input/ShareGPT",
+  "order_mode": "rotate_by_full_repeat",
+  "strategies": [
+    {
+      "name": "scheme1_fit_curve",
+      "type": "bucket",
+      "bucket_key": "output_length",
+      "buckets": [
+        [
+          8,
+          150
+        ],
+        [
+          16,
+          151
+        ],
+        [
+          32,
+          191
+        ],
+        [
+          64,
+          210
+        ],
+        [
+          Infinity,
+          220
+        ]
+      ]
+    },
+    {
+      "name": "scheme2_fit_plus",
+      "type": "bucket",
+      "bucket_key": "output_length",
+      "buckets": [
+        [
+          8,
+          150
+        ],
+        [
+          16,
+          170
+        ],
+        [
+          32,
+          200
+        ],
+        [
+          64,
+          220
+        ],
+        [
+          Infinity,
+          230
+        ]
+      ]
+    },
+    {
+      "name": "scheme3_kv_guided",
+      "type": "bucket",
+      "bucket_key": "output_length",
+      "buckets": [
+        [
+          32,
+          190
+        ],
+        [
+          96,
+          205
+        ],
+        [
+          Infinity,
+          210
+        ]
+      ]
+    },
+    {
+      "name": "baseline_350w",
+      "type": "fixed",
+      "power": 350
+    }
+  ]
+}

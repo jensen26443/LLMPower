@@ -7,9 +7,9 @@ set -euo pipefail
 
 SUDO_PASSWORD="${SUDO_PASSWORD:-}"
 OUTPUT_DIR="results_decode/feedforward_decode_pid_evaluation_full"
-MODEL_PATH="./Qwen2.5-7B-Instruct-AWQ"
-TOKENIZER_PATH="./Qwen2.5-7B-Instruct-AWQ"
-SERVED_MODEL_NAME="Qwen2.5-7B-Instruct-AWQ"
+MODEL_PATH="./Meta-Llama-3.1-8B-Instruct-AWQ-INT4"
+TOKENIZER_PATH="./Meta-Llama-3.1-8B-Instruct-AWQ-INT4"
+SERVED_MODEL_NAME="Meta-Llama-3.1-8B-Instruct-AWQ-INT4"
 SHAREGPT_DIR="./input/ShareGPT"
 BASE_URL="http://localhost:8000/v1"
 OUTPUT_LENGTHS="100,200"

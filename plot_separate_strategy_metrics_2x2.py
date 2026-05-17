@@ -23,7 +23,7 @@ from matplotlib.ticker import AutoMinorLocator, MaxNLocator
 
 ROOT = Path("experiment_results/feedforward")
 OUTPUT_DIR = ROOT / "paper_figures_ff_vs_pid_separate_bigger"
-NO_ERROR_OUTPUT_DIR = ROOT / "paper_figures_ff_vs_pid_separate_no_errorbars_bigger"
+NO_ERROR_OUTPUT_DIR = ROOT / "paper_figures_ff_vs_pid_separate_no_errorbars_image_bar"
 QUERY_COUNTS = [8, 16, 32, 64, 96, 128]
 BASELINE = "baseline_350w"
 AXIS_LABEL_SIZE = 13
@@ -104,8 +104,10 @@ def configure_matplotlib() -> None:
             "axes.labelsize": AXIS_LABEL_SIZE,
             "xtick.labelsize": TICK_LABEL_SIZE,
             "ytick.labelsize": TICK_LABEL_SIZE,
+            "hatch.linewidth": 0.45,
             "pdf.fonttype": 42,
             "ps.fonttype": 42,
+            "svg.fonttype": "none",
         }
     )
 
@@ -166,6 +168,7 @@ def validate_input(df: pd.DataFrame, spec: FigureSpec, source: Path) -> None:
 
 
 def compute_metrics(df: pd.DataFrame, spec: FigureSpec, source: Path) -> pd.DataFrame:
+    """从 aggregated CSV 计算 2x2 论文图需要的四个相对指标。"""
     validate_input(df, spec, source)
     subset = df[
         (df["strategy"].isin([BASELINE, spec.strategy]))
@@ -246,7 +249,7 @@ def compute_metrics(df: pd.DataFrame, spec: FigureSpec, source: Path) -> pd.Data
     return summary
 
 
-def clean_axis(ax: plt.Axes, values: np.ndarray, errors: np.ndarray) -> None:
+def clean_axis(ax: plt.Axes, values: np.ndarray, errors: np.ndarray, image_bar_style: bool = False) -> None:
     finite_values = values[np.isfinite(values)]
     finite_errors = errors[np.isfinite(errors)]
     if finite_values.size == 0:
@@ -265,7 +268,15 @@ def clean_axis(ax: plt.Axes, values: np.ndarray, errors: np.ndarray) -> None:
     pad = max(span * 0.12, 0.5)
     lower = data_min - pad
     upper = data_max + pad
-    if data_min >= 0 and lower < data_min * 0.55:
+    if image_bar_style:
+        if data_min < 0:
+            lower = data_min * 1.18
+            upper = data_max * 1.18 if data_max > 0 else 0.5
+            ax.axhline(0.0, color="black", linewidth=0.75, zorder=1)
+        else:
+            lower = 0.0
+            upper = data_max * 1.18 if data_max > 0 else 1.0
+    elif data_min >= 0 and lower < data_min * 0.55:
         lower = max(0.0, data_min - pad)
     ax.set_ylim(lower, upper)
     ax.yaxis.set_major_locator(MaxNLocator(nbins=5, prune=None))
@@ -275,9 +286,13 @@ def clean_axis(ax: plt.Axes, values: np.ndarray, errors: np.ndarray) -> None:
     ax.tick_params(top=False, right=False)
     for spine in ax.spines.values():
         spine.set_visible(True)
-        spine.set_linewidth(0.8)
+        spine.set_linewidth(1.1 if image_bar_style else 0.8)
         spine.set_color("black")
-    ax.grid(False)
+    if image_bar_style:
+        ax.set_axisbelow(True)
+        ax.grid(axis="y", linestyle="--", linewidth=0.5, alpha=0.22)
+    else:
+        ax.grid(False)
 
 
 def plot_figure(
@@ -286,11 +301,21 @@ def plot_figure(
     output_dir: Path,
     show_error_bars: bool = True,
     split_geomean_label: bool = False,
-) -> None:
+) -> list[Path]:
+    """绘制纯前馈 / 前馈+PID 的四联图，最终版使用无误差棒 image_bar 样式。"""
     labels = [str(q) for q in QUERY_COUNTS] + ["GEOMEAN"]
-    display_labels = [str(q) for q in QUERY_COUNTS] + (["GEO\nMEAN"] if split_geomean_label else ["GEOMEAN"])
-    x = np.arange(len(labels))
-    fig, axes = plt.subplots(2, 2, figsize=(7.4, 5.2), constrained_layout=False)
+    display_labels = [str(q) for q in QUERY_COUNTS] + ["GEOMEAN"]
+    image_bar_style = not show_error_bars
+    if image_bar_style:
+        x = np.array([0, 1, 2, 3, 4, 5, 6.65], dtype=float)
+    else:
+        x = np.arange(len(labels))
+    if image_bar_style:
+        fig, axes = plt.subplots(2, 2, figsize=(7.1, 4.05), constrained_layout=True)
+    else:
+        fig, axes = plt.subplots(2, 2, figsize=(7.4, 5.2), constrained_layout=False)
+    if image_bar_style:
+        fig.supxlabel("Query Count", fontsize=AXIS_LABEL_SIZE)
     axes_flat = axes.ravel()
 
     for idx, (metric, ylabel) in enumerate(METRICS):
@@ -302,10 +327,10 @@ def plot_figure(
         yerr = np.where(np.isfinite(errors), errors, 0.0)
         bar_kwargs = {
             "width": 0.62,
-            "color": spec.color,
+            "color": [spec.color] * 6 + ["#7F7F7F"] if image_bar_style else spec.color,
             "edgecolor": "black",
-            "linewidth": 0.45,
-            "zorder": 2,
+            "linewidth": 0.85 if image_bar_style else 0.45,
+            "zorder": 3 if image_bar_style else 2,
         }
         axis_errors = yerr if show_error_bars else np.zeros_like(values)
         if show_error_bars:
@@ -316,15 +341,23 @@ def plot_figure(
                 "capsize": 2.5,
                 "capthick": 0.65,
             }
-        ax.bar(x, values, **bar_kwargs)
-        ax.axhline(0.0, color="black", linewidth=0.6, zorder=1)
+        bars = ax.bar(x, values, **bar_kwargs)
+        if image_bar_style:
+            for bar, hatch in zip(bars, ["/"] * 6 + ["x"]):
+                bar.set_hatch(hatch)
+            ax.axvline(5.82, color="#B0B0B0", linewidth=0.65, linestyle="--", alpha=0.55, zorder=1)
+        else:
+            ax.axhline(0.0, color="black", linewidth=0.6, zorder=1)
         ax.set_ylabel(ylabel, fontsize=AXIS_LABEL_SIZE)
         ax.set_xticks(x)
         ax.set_xticklabels(display_labels, fontsize=TICK_LABEL_SIZE, rotation=0)
-        minor_ticks = (x[:-1] + x[1:]) / 2.0
-        ax.set_xticks(minor_ticks, minor=True)
-        ax.set_xlim(x[0] - 0.6, x[-1] + 0.65)
-        ax.set_xlabel("Query Count", fontsize=AXIS_LABEL_SIZE)
+        if image_bar_style:
+            ax.set_xlim(-0.6, 7.2)
+        else:
+            minor_ticks = (x[:-1] + x[1:]) / 2.0
+            ax.set_xticks(minor_ticks, minor=True)
+            ax.set_xlim(x[0] - 0.6, x[-1] + 0.65)
+            ax.set_xlabel("Query Count", fontsize=AXIS_LABEL_SIZE)
         ax.text(
             0.02,
             0.96,
@@ -335,14 +368,18 @@ def plot_figure(
             fontsize=PANEL_LABEL_SIZE,
             fontweight="normal",
         )
-        clean_axis(ax, values, axis_errors)
+        clean_axis(ax, values, axis_errors, image_bar_style=image_bar_style)
 
-    fig.subplots_adjust(left=0.08, right=0.985, bottom=0.12, top=0.985, wspace=0.28, hspace=0.43)
+    if not image_bar_style:
+        fig.subplots_adjust(left=0.08, right=0.985, bottom=0.12, top=0.985, wspace=0.28, hspace=0.43)
     png_path = output_dir / f"{spec.key}_metrics_2x2.png"
     pdf_path = output_dir / f"{spec.key}_metrics_2x2.pdf"
+    svg_path = output_dir / f"{spec.key}_metrics_2x2.svg"
     fig.savefig(png_path, dpi=600, bbox_inches="tight", facecolor="white")
     fig.savefig(pdf_path, bbox_inches="tight", facecolor="white")
+    fig.savefig(svg_path, bbox_inches="tight", facecolor="white")
     plt.close(fig)
+    return [png_path, pdf_path, svg_path]
 
 
 def write_markdown(summary: pd.DataFrame, output_path: Path) -> None:

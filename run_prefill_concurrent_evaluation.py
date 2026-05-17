@@ -203,6 +203,7 @@ def clamp_power(power_w: float,
 
 
 def evaluate_prefill_token_power_fit(total_input_tokens: int) -> float:
+    """根据 token-power 建模结果，把输入 token 数映射为 prefill 推荐功率。"""
     tokens = max(1.0, float(total_input_tokens))
     breakpoint = float(PREFILL_TOKEN_POWER_FIT["breakpoint"])
     if tokens <= breakpoint:
@@ -222,6 +223,7 @@ def recommend_manual_bucket_power(query_count: int, buckets: Sequence[Dict]) -> 
 def recommend_prefill_power(strategy: Dict,
                             query_count: int,
                             total_input_tokens: int) -> int:
+    """统一入口：根据策略类型返回本 batch 的 prefill power cap。"""
     strategy_type = strategy.get("type", "fixed")
     if strategy_type == "fixed":
         return int(strategy["power"])
@@ -263,6 +265,7 @@ def build_query_group_prompt_sets(load_generator: LoadGenerator,
                                   monitor_warmup_batches: int,
                                   queue_seed: int,
                                   full_repeat: int) -> Dict[int, List[List[Dict]]]:
+    """提前构造所有 batch，保证不同策略在同一 full repeat 中面对同一组请求。"""
     total_batches = warmup_batches + monitor_warmup_batches + repeats_per_batch
     rng = random.Random(queue_seed + full_repeat)
     prompt_sets = {}
@@ -367,6 +370,10 @@ def run_prefill_concurrent_evaluation(output_dir: str,
                                       sudo_password: Optional[str],
                                       skip_set_power: bool,
                                       strategy_names: Optional[Sequence[str]] = None):
+    """运行 prefill-only 策略评估。
+
+    该实验将 max_tokens 固定为 1，尽量隔离 prefill 阶段，重点观察 TTFT 和能耗。
+    """
     os.makedirs(output_dir, exist_ok=True)
     experiment_id = f"prefill_concurrent_eval_{int(time.time())}"
     raw_path = os.path.join(output_dir, f"{experiment_id}_raw.csv")
@@ -492,6 +499,7 @@ def run_prefill_concurrent_evaluation(output_dir: str,
                     warmup_slice = batches[:warmup_batches]
                     monitor_warmup_slice = batches[warmup_batches:warmup_batches + monitor_warmup_batches]
                     measurement_slice = batches[warmup_batches + monitor_warmup_batches:]
+                    # warmup 用于预热服务；monitor_warmup 用于让功率采样进入稳定状态，不计入统计。
                     extra_body = build_service_extra_body(sampling_seed)
 
                     for warmup_batch in warmup_slice:
@@ -549,6 +557,7 @@ def run_prefill_concurrent_evaluation(output_dir: str,
                             row["inference_end"],
                             power_data,
                         )
+                        # 对每个 measured batch 截取自己的推理窗口，避免把其他 batch 的功率混入。
                         row.update(power_stats)
                         row.pop("inference_start", None)
                         row.pop("inference_end", None)

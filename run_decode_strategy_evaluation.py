@@ -186,6 +186,7 @@ def select_decode_strategies(strategy_set: str) -> List[Dict]:
 def get_power_for_decode_strategy(strategy: Dict,
                                   output_length: int,
                                   concurrency: Optional[int] = None) -> int:
+    """根据策略分桶规则选择 decode 阶段 power cap。"""
     if strategy["type"] == "fixed":
         return int(strategy["power"])
 
@@ -220,6 +221,7 @@ def estimate_request_tbt_ms(request_result: Dict, output_tokens: int) -> float:
 
 
 def build_power_window_stats(start_time: float, end_time: float, power_data: List[Dict]) -> Dict[str, float]:
+    """截取单个 decode batch 的功率窗口，计算真实平均功率和能耗。"""
     if not power_data:
         return {"avg_power_w": 0.0, "total_energy_j": 0.0, "peak_power_w": 0.0}
 
@@ -335,6 +337,7 @@ def rotate_sequence(items: Sequence, offset: int) -> List:
 def build_experiment_blocks(strategies: Sequence[Dict],
                             output_lengths: Sequence[int],
                             full_repeats: int) -> List[Dict]:
+    """构造策略和输出长度组合，并按 full repeat 轮换顺序降低时间漂移影响。"""
     blocks = []
     for full_repeat in range(1, full_repeats + 1):
         strategy_order = rotate_sequence(strategies, full_repeat - 1)
@@ -398,6 +401,10 @@ def run_decode_strategy_evaluation(
     strategy_set: str = "legacy",
     sharegpt_dir: str = "./input/ShareGPT",
 ) -> Dict[str, str]:
+    """运行 decode-only 策略评估。
+
+    输入 prompt 固定为 1 token，输出长度按配置扫描，主要用于比较不同 decode 功率映射。
+    """
     os.makedirs(output_dir, exist_ok=True)
     if prompt_token_count != 1:
         raise ValueError("decode strategy evaluation requires prompt_token_count=1")
@@ -499,6 +506,7 @@ def run_decode_strategy_evaluation(
             )
 
             if full_repeat not in prompt_sets_by_repeat:
+                # 同一个 full_repeat 内复用 prompt_sets，保证所有策略面对同一批短 prompt。
                 prompt_sets_by_repeat[full_repeat] = build_output_prompt_sets(
                     load_generator,
                     output_lengths=DECODE_OUTPUT_LENGTHS,
@@ -515,6 +523,7 @@ def run_decode_strategy_evaluation(
                 output_length,
                 concurrency=concurrency,
             )
+            # 先设置 power cap，再执行 warmup/measurement；skip_set_power 仅用于连通性测试。
             if not skip_set_power:
                 if not set_power_cap(power_limit, sudo_password=sudo_password):
                     raise RuntimeError(
@@ -540,6 +549,7 @@ def run_decode_strategy_evaluation(
 
             monitor = PowerMonitor(sample_interval=0.02)
             monitor.start()
+            # monitor_warmup 不进入统计，只用于让采样和功率状态稳定。
             for prompt_batch in monitor_warmup_prompts:
                 inferencer.infer_concurrent(
                     prompt_batch,

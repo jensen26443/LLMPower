@@ -1,0 +1,58 @@
+{
+  "8": {
+    "strategy": "prefill_token_fit",
+    "recommended_power": 193,
+    "target_input_tokens": 225,
+    "ttft_increase_pct": 3.147101149387721,
+    "energy_saving_pct": 5.587175401929345,
+    "status": "ok"
+  },
+  "16": {
+    "strategy": "prefill_manual_buckets",
+    "recommended_power": 200,
+    "target_input_tokens": 504,
+    "ttft_increase_pct": -0.4910733405273926,
+    "energy_saving_pct": 9.90189808691695,
+    "status": "ok"
+  },
+  "32": {
+    "strategy": "prefill_manual_buckets",
+    "recommended_power": 220,
+    "target_input_tokens": 1581,
+    "ttft_increase_pct": 3.7857659842549296,
+    "energy_saving_pct": 7.731794197457553,
+    "status": "ok"
+  },
+  "64": {
+    "strategy": "prefill_manual_buckets",
+    "recommended_power": 220,
+    "target_input_tokens": 2175,
+    "ttft_increase_pct": 3.1029136332154206,
+    "energy_saving_pct": 12.249062066075245,
+    "status": "ok"
+  },
+  "103": {
+    "strategy": "prefill_manual_buckets",
+    "recommended_power": 260,
+    "target_input_tokens": 6053,
+    "ttft_increase_pct": 2.723786359629532,
+    "energy_saving_pct": 6.9776304831426605,
+    "status": "ok"
+  },
+  "112": {
+    "strategy": "prefill_manual_buckets",
+    "recommended_power": 260,
+    "target_input_tokens": 11106,
+    "ttft_increase_pct": 3.9547684409527717,
+    "energy_saving_pct": 7.9212801291429935,
+    "status": "ok"
+  },
+  "119": {
+    "strategy": "prefill_manual_buckets",
+    "recommended_power": 260,
+    "target_input_tokens": 20295,
+    "ttft_increase_pct": 3.4708349451354703,
+    "energy_saving_pct": 11.35017693712943,
+    "status": "ok"
+  }
+}

@@ -214,6 +214,12 @@ class ShareGPTLoader:
 
 
 class LoadGenerator:
+    """实验负载生成器。
+
+    优先从 ShareGPT 选取接近目标 token 数的真实 prompt；找不到时再回退到
+    合成 prompt。这样可以在可控输入长度的同时保留较真实的请求分布。
+    """
+
     def __init__(self, sharegpt_dir: str = "./input/ShareGPT",
                  tokenizer_name: str = "./Qwen2.5-7B-Instruct-AWQ"):
         # 预置不同长度的prompt模板
@@ -302,6 +308,7 @@ class LoadGenerator:
         # 优先尝试从ShareGPT获取真实数据
         prompt = None
         if prefer_sharegpt and self.sharegpt_loader:
+            # token_count 越大允许的容差略增，避免长 prompt 因少量 token 偏差被过度丢弃。
             tolerance = max(2, min(32, token_count // 20))
             prompt = self.sharegpt_loader.get_prompt_by_token_count(token_count, tolerance=tolerance)
             if prompt:

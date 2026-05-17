@@ -1,0 +1,11 @@
+metric,value
+config_count,135.0
+batch_min,1.0
+batch_max,64.0
+target_output_min,10.0
+target_output_max,300.0
+avg_power_min_w,108.859
+avg_power_max_w,233.358
+avg_tbt_min_ms,66.59
+avg_tbt_max_ms,74.271
+p95_tbt_max_ms,82.375

@@ -1,0 +1,72 @@
+{
+  "experiment_id": "feedforward_eval_1778758921",
+  "strategies": [
+    "baseline_350w",
+    "ff_decode_tbt_guarded_pid"
+  ],
+  "query_groups": [
+    {
+      "query_count": 8,
+      "target_input_tokens": 225
+    },
+    {
+      "query_count": 16,
+      "target_input_tokens": 504
+    },
+    {
+      "query_count": 32,
+      "target_input_tokens": 1581
+    },
+    {
+      "query_count": 64,
+      "target_input_tokens": 2175
+    },
+    {
+      "query_count": 96,
+      "target_input_tokens": 11106
+    },
+    {
+      "query_count": 128,
+      "target_input_tokens": 22873
+    }
+  ],
+  "output_lengths": [
+    100
+  ],
+  "repeats_per_batch": 50,
+  "full_repeats": 3,
+  "warmup_batches": 2,
+  "monitor_warmup_batches": 1,
+  "queue_seed": 20260401,
+  "sampling_seed": 20260401,
+  "base_url": "http://localhost:8000/v1",
+  "model_path": "./Meta-Llama-3.1-8B-Instruct-AWQ-INT4",
+  "served_model_name": "Meta-Llama-3.1-8B-Instruct-AWQ-INT4",
+  "tokenizer_path": "./Meta-Llama-3.1-8B-Instruct-AWQ-INT4",
+  "sharegpt_dir": "./input/ShareGPT",
+  "skip_set_power": false,
+  "decode_recommendation_json": "experiment_results/decode_power_cap_batch_sweep/multi_load_tbt5_out100/images/decode_bucket_recommendations_q64_q96_205w_q128_210w_override.json",
+  "pid_targets_path": "feedforward_pid_targets.json",
+  "pid_config": {
+    "kp_prefill": 0.1,
+    "kp_decode": 0.45,
+    "ki": 0.0,
+    "kd": 0.0,
+    "pid_interval_sec": 2.0,
+    "pid_delta_limit_w": 20.0,
+    "pid_max_step_w": 10.0,
+    "pid_min_power_change_w": 5.0,
+    "pid_deadband_ms": 1.0,
+    "pid_min_decode_samples": 4,
+    "pid_initial_skip_windows": 1,
+    "pid_decode_confirm_windows": 2,
+    "pid_decay_step_w": 5.0,
+    "pid_feedback_window_samples": 32,
+    "pid_ewma_alpha": 1.0,
+    "pid_power_max_w": 350,
+    "pid_ttft_budget_ratio": 1.05,
+    "pid_tbt_budget_ratio": 1.05
+  },
+  "started_at": 1778758939.2762446,
+  "finished_at": 1778780720.5616596
+}

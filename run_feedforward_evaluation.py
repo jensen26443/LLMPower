@@ -626,6 +626,7 @@ def rotate_items(items: Sequence, offset: int) -> List:
 
 
 def build_power_window_stats(start_time: float, end_time: float, power_data: List[Dict]) -> Dict[str, float]:
+    """截取当前推理窗口内的功率采样，计算该 batch 的功率与能耗指标。"""
     if not power_data:
         return {
             "avg_power_w": 0.0,
@@ -657,6 +658,12 @@ def build_power_window_stats(start_time: float, end_time: float, power_data: Lis
 
 
 class FeedforwardController:
+    """纯前馈控制器。
+
+    控制器只根据实验前定义好的 prefill/decode 功率规则动作：
+    prefill 开始前设置一次功率，decode 流式生成过程中根据当前 KVB 估计切换功率。
+    """
+
     def __init__(self,
                  strategy: Dict,
                  prompt_token_counts: Sequence[int],
@@ -689,6 +696,7 @@ class FeedforwardController:
         if self.current_power_limit is not None:
             self.power_change_count += 1
         self.current_power_limit = power
+        # power_event_trace 用于复盘一次 batch 中每次功率切换的阶段、时间和 KVB 状态。
         self.power_event_trace.append({
             "power_limit": int(power),
             "reason": reason,
@@ -699,6 +707,7 @@ class FeedforwardController:
 
     def start(self) -> int:
         with self._lock:
+            # baseline 全程固定 350W；前馈策略按输入规模选择 prefill 功率。
             if self.strategy["type"] == "baseline":
                 power = int(self.strategy["prefill_power"])
             else:
@@ -730,6 +739,7 @@ class FeedforwardController:
             if event_type not in {"first_token", "chunk", "finished"}:
                 return
 
+            # KVB 反映当前仍在 decode 的请求和已生成 token 压力，用它选择 decode 功率桶。
             kvb = compute_kvb(
                 prompt_token_counts=self.prompt_token_counts,
                 generated_token_counts=self.generated_token_counts,
@@ -742,6 +752,12 @@ class FeedforwardController:
 
 
 class FeedforwardPIDGuardController:
+    """前馈 + PID guard 控制器。
+
+    前馈规则给出基础功率，PID 只在 TTFT/TBT 超预算时做正向补偿。
+    这样可以保留前馈节能收益，同时避免个别 batch 的延迟明显失控。
+    """
+
     def __init__(self,
                  strategy: Dict,
                  prompt_token_counts: Sequence[int],
@@ -844,6 +860,7 @@ class FeedforwardPIDGuardController:
 
     def start(self) -> int:
         with self._lock:
+            # PID guard 的 prefill 功率 = 前馈基础功率 + 上一轮 TTFT 误差产生的补偿。
             base_power = get_prefill_power_for_total_tokens(
                 self.routing_input_tokens,
                 prefill_buckets=self.strategy.get("prefill_buckets"),
@@ -872,6 +889,7 @@ class FeedforwardPIDGuardController:
             estimates.append((float(last_wall) - float(first_wall)) * 1000.0 / (int(generated_tokens) - 1))
         if not estimates:
             return None
+        # 优先使用最近 chunk 间隔的中位数，减少单个请求长尾对 decode PID 的影响。
         raw_feedback = (
             float(statistics.median(self._recent_tbt_samples_ms))
             if self._recent_tbt_samples_ms
@@ -936,6 +954,7 @@ class FeedforwardPIDGuardController:
             if event_type not in {"first_token", "chunk", "finished"}:
                 return
 
+            # 先执行前馈 decode 桶切换，再判断是否需要 PID 补偿。
             kvb = compute_kvb(
                 prompt_token_counts=self.prompt_token_counts,
                 generated_token_counts=self.generated_token_counts,
@@ -987,6 +1006,7 @@ class FeedforwardPIDGuardController:
             if error <= float(self.pid_config["pid_deadband_ms"]):
                 self._decode_over_budget_windows = 0
                 if self.pid_decode_delta_w > 0.0:
+                    # 延迟回到预算内时逐步衰减补偿，避免频繁大幅度来回切换功率。
                     self.pid_decode_delta_w = max(
                         0.0,
                         self.pid_decode_delta_w - float(self.pid_config.get("pid_decay_step_w", 0.0)),
@@ -1117,6 +1137,7 @@ def run_feedforward_evaluation(output_dir: str,
                                decode_recommendation_json: Optional[str] = None,
                                pid_targets_path: str = DEFAULT_PID_TARGETS_PATH,
                                pid_config: Optional[Dict[str, float]] = None):
+    """运行完整前馈 / 前馈+PID 评估，并持续输出 raw、aggregated、metadata 和 progress 文件。"""
     os.makedirs(output_dir, exist_ok=True)
     experiment_id = f"feedforward_eval_{int(time.time())}"
     raw_path = os.path.join(output_dir, f"{experiment_id}_raw.csv")
@@ -1192,6 +1213,7 @@ def run_feedforward_evaluation(output_dir: str,
     def apply_power_cap(power: int, verify: bool = False) -> bool:
         if skip_set_power:
             return True
+        # 所有控制器都通过这个回调下发功率；verify 只在关键阶段等待实际 power limit 生效。
         if not set_power_cap(power, sudo_password=sudo_password):
             return False
         if verify:
@@ -1259,6 +1281,7 @@ def run_feedforward_evaluation(output_dir: str,
                         warmup_slice = batches[:warmup_batches]
                         monitor_warmup_slice = batches[warmup_batches:warmup_batches + monitor_warmup_batches]
                         measurement_slice = batches[warmup_batches + monitor_warmup_batches:]
+                        # warmup 不计入统计；monitor_warmup 用于让功率和服务状态稳定后再进入测量窗口。
 
                         extra_body = build_service_extra_body(
                             output_length=int(output_length),
@@ -1346,6 +1369,7 @@ def run_feedforward_evaluation(output_dir: str,
                             power_monitor = PowerMonitor(sample_interval=0.02)
                             power_monitor.start()
                             time.sleep(0.2)
+                            # wall_start/wall_end 定义能耗积分窗口，避免把 batch 间隔计入能耗。
                             wall_start = time.time()
                             results = inferencer.infer_concurrent(
                                 [item["prompt"] for item in batch_prompts],
@@ -1379,6 +1403,7 @@ def run_feedforward_evaluation(output_dir: str,
                                 "pid_decode_error_ms": getattr(controller, "pid_decode_error_ms", None) or "",
                                 "pid_decode_feedback_tbt_ms": getattr(controller, "pid_decode_feedback_tbt_ms", None) or "",
                                 "power_change_count": controller.power_change_count,
+                                # trace 字段用于结题时复盘一次 batch 中 prefill/decode/PID 的实际动作。
                                 "power_event_trace_json": json.dumps(controller.power_event_trace, ensure_ascii=False),
                                 "pid_event_trace_json": json.dumps(getattr(controller, "pid_event_trace", []), ensure_ascii=False),
                                 **metric_stats,
@@ -1439,9 +1464,9 @@ def run_feedforward_evaluation(output_dir: str,
 def parse_args():
     parser = argparse.ArgumentParser(description="Run feedforward power-control evaluation.")
     parser.add_argument("--output-dir", default="results_decode/feedforward_evaluation")
-    parser.add_argument("--model-path", default="./Qwen2.5-7B-Instruct-AWQ")
-    parser.add_argument("--served-model-name", default="Qwen2.5-7B-Instruct-AWQ")
-    parser.add_argument("--tokenizer-path", default="./Qwen2.5-7B-Instruct-AWQ")
+    parser.add_argument("--model-path", default="./Meta-Llama-3.1-8B-Instruct-AWQ-INT4")
+    parser.add_argument("--served-model-name", default="Meta-Llama-3.1-8B-Instruct-AWQ-INT4")
+    parser.add_argument("--tokenizer-path", default="./Meta-Llama-3.1-8B-Instruct-AWQ-INT4")
     parser.add_argument("--sharegpt-dir", default="./input/ShareGPT")
     parser.add_argument("--base-url", default="http://localhost:8000/v1")
     parser.add_argument("--output-lengths", default="100,200")

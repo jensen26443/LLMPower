@@ -267,6 +267,7 @@ def set_power_cap(watts, device_index=0, sudo_password=None):
     """
     try:
         nvidia_smi = get_nvidia_smi_path()
+        # 策略脚本最终都通过这里落到真实硬件 power limit，而不是只记录策略标签。
         _run_sudo_command(
             [nvidia_smi, "-i", str(device_index), "-pl", str(watts)],
             sudo_password=sudo_password,

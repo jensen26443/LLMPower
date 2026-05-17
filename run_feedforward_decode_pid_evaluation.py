@@ -974,9 +974,9 @@ def run_feedforward_decode_pid_evaluation(output_dir: str,
 def parse_args():
     parser = argparse.ArgumentParser(description="Run feedforward decode PID evaluation.")
     parser.add_argument("--output-dir", default="results_decode/feedforward_decode_pid_evaluation")
-    parser.add_argument("--model-path", default="./Qwen2.5-7B-Instruct-AWQ")
-    parser.add_argument("--served-model-name", default="Qwen2.5-7B-Instruct-AWQ")
-    parser.add_argument("--tokenizer-path", default="./Qwen2.5-7B-Instruct-AWQ")
+    parser.add_argument("--model-path", default="./Meta-Llama-3.1-8B-Instruct-AWQ-INT4")
+    parser.add_argument("--served-model-name", default="Meta-Llama-3.1-8B-Instruct-AWQ-INT4")
+    parser.add_argument("--tokenizer-path", default="./Meta-Llama-3.1-8B-Instruct-AWQ-INT4")
     parser.add_argument("--sharegpt-dir", default="./input/ShareGPT")
     parser.add_argument("--base-url", default="http://localhost:8000/v1")
     parser.add_argument("--output-lengths", default="100,200")

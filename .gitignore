@@ -62,6 +62,7 @@ summary/
 
 # Model files
 Qwen2.5-7B-Instruct-AWQ/
+Meta-Llama-3.1-8B-Instruct-AWQ-INT4/
 
 # Input data
 input/
@@ -83,6 +84,7 @@ test_load.py
 test_prefill_system.py
 test_ttft_fix.py
 test_ttft_simple.py
+test_analyze_decode_modeling.py
 
 # Local-only utility scripts
 adapt_to_server.py
@@ -97,5 +99,6 @@ run_bucket1_only.sh
 run_with_sudo.py
 
 # Local-only experiment outputs
+experiment_results/
 results_decode/
 openai-chat-*.json

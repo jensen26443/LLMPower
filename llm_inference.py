@@ -36,6 +36,12 @@ except ImportError:
 
 
 class LLMInferencer:
+    """统一封装离线 vLLM 和 OpenAI 兼容服务两种推理模式。
+
+    结题实验主要使用服务模式：通过流式返回记录首 token、后续 token 和完成时间，
+    从同一请求链路中计算 TTFT、TBT、E2E，保证不同功率策略的对比口径一致。
+    """
+
     def __init__(
         self,
         model_name: str = "./Qwen2.5-7B-Instruct-AWQ",
@@ -160,6 +166,7 @@ class LLMInferencer:
     ) -> Dict:
         """按服务请求模式构造 API 参数。"""
         if self.service_request_mode == "completion":
+            # completion 模式用于固定 prompt / output token 的实验，便于和 vLLM bench 口径对齐。
             request_kwargs = {
                 "model": self.served_model_name,
                 "prompt": prompt,
@@ -170,6 +177,7 @@ class LLMInferencer:
             if extra_body:
                 request_kwargs.update(extra_body)
         else:
+            # chat 模式保留给普通对话式调用；主实验默认走 completion 模式。
             request_kwargs = {
                 "model": self.served_model_name,
                 "messages": [{"role": "user", "content": prompt}],
@@ -230,6 +238,7 @@ class LLMInferencer:
     def _extract_stream_text(self, chunk) -> Optional[str]:
         """从流式返回中提取当前 chunk 的文本。"""
         if isinstance(chunk, dict):
+            # httpx 直连 /completions 时返回 dict；OpenAI SDK 返回对象，两种格式都兼容。
             choices = chunk.get("choices") or []
             if not choices:
                 return None
